@@ -1,171 +1,120 @@
 import express from "express";
-import admin from "firebase-admin";
-import fetch from "node-fetch";
 import cors from "cors";
 import crypto from "crypto";
+import { db } from "./firebase.js";
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
-// 🔥 Firebase Admin
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-
-const MP_WEBHOOK_SECRET = "c809285050410d37188b5cc005a726deada3715cce53638b1db2d6c01bba42ee";
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-
-const db = admin.firestore();
-
-// 🔑 TU TOKEN REAL
+// 🔐 ENV
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
 
 // =============================
-// 🟢 CREAR SUSCRIPCIÓN
+// 🚀 CREAR PREFERENCIA DE PAGO
 // =============================
-app.post("/crear-suscripcion", async (req, res) => {
-
+app.post("/crear-preferencia", async (req, res) => {
   try {
+    const { email, nombre } = req.body;
 
-    const { user_id, email } = req.body;
-
-    if(!user_id){
-      return res.status(400).json({ error: "Falta user_id" });
+    if (!email || !nombre) {
+      return res.status(400).json({ error: "Datos incompletos" });
     }
 
-    const response = await fetch("https://api.mercadopago.com/preapproval", {
+    const referenceId = crypto.randomUUID();
+
+    // Guardar intento en Firestore
+    await db.collection("pagos").doc(referenceId).set({
+      email,
+      nombre,
+      estado: "pendiente",
+      createdAt: new Date()
+    });
+
+    const response = await fetch("https://api.mercadopago.com/checkout/preferences", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MP_ACCESS_TOKEN}`
+        "Authorization": `Bearer ${MP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        reason: "Suscripción PRO WebHoy",
-        auto_recurring: {
-          frequency: 1,
-          frequency_type: "months",
-          transaction_amount: 5000,
-          currency_id: "CLP"
+        items: [
+          {
+            title: "Acceso Examen Laboral",
+            quantity: 1,
+            unit_price: 5000
+          }
+        ],
+        back_urls: {
+          success: `${BASE_URL}/gracias.html`,
+          failure: `${BASE_URL}/error.html`,
+          pending: `${BASE_URL}/pendiente.html`
         },
-        back_url: "https://TU-DOMINIO/activar.html",
-        payer_email: email || "test@test.com",
-        metadata: {
-          user_id: user_id   // 🔥 CLAVE
-        }
+        auto_return: "approved",
+        external_reference: referenceId,
+        notification_url: `${BASE_URL}/webhook`
       })
     });
 
     const data = await response.json();
 
-    if(!data.init_point){
-      console.log(data);
-      return res.status(500).json({ error: "Error creando pago" });
-    }
+    res.json({ init_point: data.init_point });
 
-    res.json({ url: data.init_point });
-
-  } catch(err){
-    console.error(err);
-    res.status(500).json({ error: "Error servidor" });
+  } catch (error) {
+    console.error("Error crear-preferencia:", error);
+    res.status(500).json({ error: "Error interno" });
   }
-
 });
 
-
 // =============================
-// 🔔 WEBHOOK
+// 🔔 WEBHOOK MERCADOPAGO
 // =============================
 app.post("/webhook", async (req, res) => {
-
   try {
+    const paymentId = req.body?.data?.id;
 
-     // 🔐 VALIDACIÓN
-    if(!verificarFirma(req)){
-      console.log("❌ Firma inválida");
-      return res.sendStatus(401);
-    }
+    if (!paymentId) return res.sendStatus(200);
 
-    const paymentId = req.body.data?.id;
-
-    if(!paymentId){
-      return res.sendStatus(200);
-    }
-
-    const mpRes = await fetch(
-      `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`
-        }
+    // Consultar pago real
+    const response = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: {
+        "Authorization": `Bearer ${MP_ACCESS_TOKEN}`
       }
-    );
+    });
 
-    const payment = await mpRes.json();
+    const payment = await response.json();
 
-    console.log("Estado:", payment.status);
+    const referenceId = payment.external_reference;
 
-    if(payment.status === "approved"){
+    if (!referenceId) return res.sendStatus(200);
 
-      const userId = payment.metadata?.user_id;
-
-      if(!userId){
-        console.log("Sin user_id");
-        return res.sendStatus(200);
-      }
-
-      await db.collection("users").doc(userId).update({
-        premium: true,
-        premiumSince: admin.firestore.FieldValue.serverTimestamp()
+    if (payment.status === "approved") {
+      await db.collection("pagos").doc(referenceId).update({
+        estado: "pagado",
+        paidAt: new Date()
       });
 
-      console.log("Usuario PREMIUM:", userId);
+      console.log("✅ Pago aprobado:", referenceId);
     }
 
     res.sendStatus(200);
 
-  } catch(err){
-    console.error(err);
+  } catch (error) {
+    console.error("Error webhook:", error);
     res.sendStatus(500);
   }
-
 });
 
-
-app.listen(3000, () => {
-  console.log("🔥 Server listo en http://localhost:3000");
+// =============================
+// ❤️ HEALTH CHECK
+// =============================
+app.get("/", (req, res) => {
+  res.send("Servidor OK 🚀");
 });
 
-
-function verificarFirma(req) {
-
-  const signature = req.headers["x-signature"];
-  const requestId = req.headers["x-request-id"];
-
-  if(!signature || !requestId){
-    return false;
-  }
-
-  const dataID = req.body?.data?.id;
-
-  const manifest = `id:${dataID};request-id:${requestId};`;
-
-  const hmac = crypto
-    .createHmac("sha256", MP_WEBHOOK_SECRET)
-    .update(manifest)
-    .digest("hex");
-
-  return signature.includes(hmac);
-}
-
-
+// =============================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log("Servidor corriendo en puerto", PORT);
 });
