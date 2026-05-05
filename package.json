@@ -1,0 +1,11 @@
+{
+  "name": "webhook-mp",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "node-fetch": "^3.3.2",
+    "cors": "^2.8.5"
+  }
+}
