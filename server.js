@@ -9,7 +9,11 @@ app.use(express.json());
 app.use(cors());
 
 // 🔥 Firebase Admin
-import serviceAccount from "./serviceAccountKey.json" assert { type: "json" };
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 const MP_WEBHOOK_SECRET = "c809285050410d37188b5cc005a726deada3715cce53638b1db2d6c01bba42ee";
 
@@ -20,7 +24,7 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // 🔑 TU TOKEN REAL
-const MP_ACCESS_TOKEN = "TU_ACCESS_TOKEN_AQUI";
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
 // =============================
 // 🟢 CREAR SUSCRIPCIÓN
