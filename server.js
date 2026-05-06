@@ -16,7 +16,8 @@ const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
 // =============================
 app.post("/crear-preferencia", async (req, res) => {
   try {
-    const { email, nombre } = req.body;
+    
+    const { email, nombre, user_id } = req.body;
 
     if (!email || !nombre) {
       return res.status(400).json({ error: "Datos incompletos" });
@@ -28,6 +29,7 @@ app.post("/crear-preferencia", async (req, res) => {
     await db.collection("pagos").doc(referenceId).set({
       email,
       nombre,
+      user_id, // 🔥 CLAVE
       estado: "pendiente",
       createdAt: new Date()
     });
@@ -58,6 +60,15 @@ app.post("/crear-preferencia", async (req, res) => {
     });
 
     const data = await response.json();
+
+    console.log("🔥 RESPUESTA MP:", data); // 👈 CLAVE
+
+    if (!data.init_point) {
+      return res.status(500).json({
+        error: "MercadoPago rechazó la solicitud",
+        detalle: data
+      });
+    }
 
     res.json({ init_point: data.init_point });
 
@@ -90,12 +101,36 @@ app.post("/webhook", async (req, res) => {
     if (!referenceId) return res.sendStatus(200);
 
     if (payment.status === "approved") {
-      await db.collection("pagos").doc(referenceId).update({
+
+      const pagoRef = db.collection("pagos").doc(referenceId);
+      const pagoDoc = await pagoRef.get();
+
+      if (!pagoDoc.exists) {
+        console.log("Pago no encontrado");
+        return res.sendStatus(200);
+      }
+
+      const data = pagoDoc.data();
+      const userId = data.user_id;
+
+      // 🔥 marcar pago
+      await pagoRef.update({
         estado: "pagado",
         paidAt: new Date()
       });
 
-      console.log("✅ Pago aprobado:", referenceId);
+      // 🔥 activar premium
+      if (userId) {
+        await db.collection("users").doc(userId).update({
+          premium: true,
+          premiumSince: new Date()
+        });
+
+        console.log("🔥 Usuario PREMIUM:", userId);
+      } else {
+        console.log("No hay user_id en pago");
+      }
+
     }
 
     res.sendStatus(200);
