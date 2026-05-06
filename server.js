@@ -12,69 +12,49 @@ const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
 
 // =============================
-// 🚀 CREAR PREFERENCIA DE PAGO
+// 🚀 CREAR SUSCRIPCIÓN
 // =============================
-app.post("/crear-preferencia", async (req, res) => {
+app.post("/crear-suscripcion", async (req, res) => {
   try {
-    
-    const { email, nombre, user_id } = req.body;
+    const { email, user_id } = req.body;
 
-    if (!email || !nombre) {
-      return res.status(400).json({ error: "Datos incompletos" });
+    if (!email || !user_id) {
+      return res.status(400).json({ error: "Faltan datos" });
     }
 
-    const referenceId = crypto.randomUUID();
-
-    // Guardar intento en Firestore
-    await db.collection("pagos").doc(referenceId).set({
-      email,
-      nombre,
-      user_id, // 🔥 CLAVE
-      estado: "pendiente",
-      createdAt: new Date()
-    });
-
-    const response = await fetch("https://api.mercadopago.com/checkout/preferences", {
+    const response = await fetch("https://api.mercadopago.com/preapproval", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${MP_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        items: [
-          {
-            title: "Acceso Examen Laboral",
-            quantity: 1,
-            unit_price: 990
-          }
-        ],
-        back_urls: {
-          success: `${BASE_URL}/gracias.html`,
-          failure: `${BASE_URL}/error.html`,
-          pending: `${BASE_URL}/pendiente.html`
+        reason: "Suscripción PRO WebHoy",
+        auto_recurring: {
+          frequency: 1,
+          frequency_type: "months",
+          transaction_amount: 5000,
+          currency_id: "CLP"
         },
-        auto_return: "approved",
-        external_reference: referenceId,
-        notification_url: `${BASE_URL}/webhook`
+        payer_email: email,
+        back_url: `${BASE_URL}/gracias.html`,
+        external_reference: user_id // 🔥 CLAVE
       })
     });
 
     const data = await response.json();
 
-    console.log("🔥 RESPUESTA MP:", data); // 👈 CLAVE
+    console.log("MP RESPONSE:", data);
 
     if (!data.init_point) {
-      return res.status(500).json({
-        error: "MercadoPago rechazó la solicitud",
-        detalle: data
-      });
+      return res.status(500).json({ error: data });
     }
 
     res.json({ init_point: data.init_point });
 
-  } catch (error) {
-    console.error("Error crear-preferencia:", error);
-    res.status(500).json({ error: "Error interno" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error creando suscripción" });
   }
 });
 
@@ -83,60 +63,62 @@ app.post("/crear-preferencia", async (req, res) => {
 // =============================
 app.post("/webhook", async (req, res) => {
   try {
-    const paymentId = req.body?.data?.id;
 
-    if (!paymentId) return res.sendStatus(200);
+    const type = req.body.type;
+    const id = req.body.data?.id;
 
-    // Consultar pago real
-    const response = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-      headers: {
-        "Authorization": `Bearer ${MP_ACCESS_TOKEN}`
+    if (type !== "preapproval" || !id) {
+      return res.sendStatus(200);
+    }
+
+    // 🔥 CONSULTAR SUSCRIPCIÓN
+    const response = await fetch(
+      `https://api.mercadopago.com/preapproval/${id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${MP_ACCESS_TOKEN}`
+        }
       }
-    });
+    );
 
-    const payment = await response.json();
+    const sub = await response.json();
 
-    const referenceId = payment.external_reference;
+    console.log("SUB:", sub.status);
 
-    if (!referenceId) return res.sendStatus(200);
+    const userId = sub.external_reference;
 
-    if (payment.status === "approved") {
+    if (!userId) return res.sendStatus(200);
 
-      const pagoRef = db.collection("pagos").doc(referenceId);
-      const pagoDoc = await pagoRef.get();
+    // =============================
+    // 🟢 ACTIVA
+    // =============================
+    if (sub.status === "authorized") {
 
-      if (!pagoDoc.exists) {
-        console.log("Pago no encontrado");
-        return res.sendStatus(200);
-      }
+      await db.collection("users").doc(userId).set({
+        premium: true,
+        subscriptionId: id,
+        premiumSince: new Date()
+      }, { merge: true });
 
-      const data = pagoDoc.data();
-      const userId = data.user_id;
+      console.log("🔥 PREMIUM ACTIVADO:", userId);
+    }
 
-      // 🔥 marcar pago
-      await pagoRef.update({
-        estado: "pagado",
-        paidAt: new Date()
+    // =============================
+    // 🔴 CANCELADA / PAUSADA
+    // =============================
+    if (["paused", "cancelled"].includes(sub.status)) {
+
+      await db.collection("users").doc(userId).update({
+        premium: false
       });
 
-      // 🔥 activar premium
-      if (userId) {
-        await db.collection("users").doc(userId).update({
-          premium: true,
-          premiumSince: new Date()
-        });
-
-        console.log("🔥 Usuario PREMIUM:", userId);
-      } else {
-        console.log("No hay user_id en pago");
-      }
-
+      console.log("❌ PREMIUM DESACTIVADO:", userId);
     }
 
     res.sendStatus(200);
 
-  } catch (error) {
-    console.error("Error webhook:", error);
+  } catch (err) {
+    console.error(err);
     res.sendStatus(500);
   }
 });
@@ -152,4 +134,45 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor corriendo en puerto", PORT);
+});
+
+//CANCELAR SUSCRIPCIÓN
+app.post("/cancelar-suscripcion", async (req, res) => {
+  try {
+
+    const { user_id } = req.body;
+
+    const userDoc = await db.collection("users").doc(user_id).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "Usuario no existe" });
+    }
+
+    const subId = userDoc.data().subscriptionId;
+
+    if (!subId) {
+      return res.status(400).json({ error: "No tiene suscripción" });
+    }
+
+    await fetch(`https://api.mercadopago.com/preapproval/${subId}`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        status: "cancelled"
+      })
+    });
+
+    await db.collection("users").doc(user_id).update({
+      premium: false
+    });
+
+    res.json({ ok: true });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error cancelando" });
+  }
 });
