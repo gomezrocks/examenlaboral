@@ -45,7 +45,7 @@ app.post("/crear-preferencia", async (req, res) => {
           {
             title: "Acceso Examen Laboral",
             quantity: 1,
-            unit_price: 9990
+            unit_price: 990
           }
         ],
         back_urls: {
