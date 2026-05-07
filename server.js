@@ -64,13 +64,18 @@ app.post("/crear-suscripcion", async (req, res) => {
 app.post("/webhook", async (req, res) => {
   try {
 
+    console.log("🔥 WEBHOOK:", JSON.stringify(req.body, null, 2));
+
     const type = req.body.type;
     const id = req.body.data?.id;
 
-    if (type !== "preapproval" || !id) {
+    if (!id) {
+      console.log("❌ Sin ID");
       return res.sendStatus(200);
     }
 
+    console.log("TYPE:", type);
+    console.log("ID:", id);
     // 🔥 CONSULTAR SUSCRIPCIÓN
     const response = await fetch(
       `https://api.mercadopago.com/preapproval/${id}`,
@@ -92,7 +97,7 @@ app.post("/webhook", async (req, res) => {
     // =============================
     // 🟢 ACTIVA
     // =============================
-    if (sub.status === "authorized") {
+    if (sub.status === "authorized" || sub.status === "active"){
 
       await db.collection("users").doc(userId).set({
         premium: true,
