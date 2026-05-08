@@ -14,50 +14,107 @@ const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
 // =============================
 // 🚀 CREAR SUSCRIPCIÓN
 // =============================
+// =============================
+// 🚀 CREAR SUSCRIPCIÓN
+// =============================
 app.post("/crear-suscripcion", async (req, res) => {
+
   try {
+
     const { email, user_id } = req.body;
 
+    console.log("=================================");
+    console.log("🚀 CREANDO SUSCRIPCIÓN");
+    console.log("EMAIL:", email);
+    console.log("USER ID:", user_id);
+    console.log("BASE URL:", BASE_URL);
+    console.log(
+      "TOKEN:",
+      MP_ACCESS_TOKEN
+        ? MP_ACCESS_TOKEN.substring(0, 15) + "..."
+        : "NO TOKEN"
+    );
+    console.log("=================================");
+
     if (!email || !user_id) {
-      return res.status(400).json({ error: "Faltan datos" });
+
+      console.log("❌ Faltan datos");
+
+      return res.status(400).json({
+        error: "Faltan datos"
+      });
     }
 
-    const response = await fetch("https://api.mercadopago.com/preapproval", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-        "Content-Type": "application/json"
+    const payload = {
+      reason: "Suscripción PRO WebHoy",
+
+      auto_recurring: {
+        frequency: 1,
+        frequency_type: "months",
+        transaction_amount: 990,
+        currency_id: "CLP"
       },
-      body: JSON.stringify({
-        reason: "Suscripción PRO WebHoy",
-        auto_recurring: {
-          frequency: 1,
-          frequency_type: "months",
-          transaction_amount: 990,
-          currency_id: "CLP"
+
+      payer_email: email,
+
+      back_url: `${BASE_URL}/gracias.html`,
+
+      external_reference: user_id
+    };
+
+    console.log(
+      "📦 PAYLOAD:",
+      JSON.stringify(payload, null, 2)
+    );
+
+    const response = await fetch(
+      "https://api.mercadopago.com/preapproval",
+      {
+        method: "POST",
+
+        headers: {
+          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+          "Content-Type": "application/json"
         },
-        payer_email: email,
-        back_url: `${BASE_URL}/gracias.html`,
-        external_reference: user_id // 🔥 CLAVE
-      })
-    });
+
+        body: JSON.stringify(payload)
+      }
+    );
+
+    console.log("🔥 MP STATUS:", response.status);
 
     const data = await response.json();
 
-    console.log("MP RESPONSE:", data);
+    console.log(
+      "🔥 MP RESPONSE:",
+      JSON.stringify(data, null, 2)
+    );
 
     if (!data.init_point) {
-      return res.status(500).json({ error: data });
+
+      console.log("❌ No viene init_point");
+
+      return res.status(500).json({
+        error: data
+      });
     }
 
-    res.json({ init_point: data.init_point });
+    console.log("✅ SUSCRIPCIÓN CREADA");
+
+    res.json({
+      init_point: data.init_point
+    });
 
   } catch (err) {
+
+    console.error("❌ ERROR CREAR SUSCRIPCIÓN:");
     console.error(err);
-    res.status(500).json({ error: "Error creando suscripción" });
+
+    res.status(500).json({
+      error: "Error creando suscripción"
+    });
   }
 });
-
 // =============================
 // 🔔 WEBHOOK MERCADOPAGO
 // =============================
@@ -65,7 +122,7 @@ app.post("/webhook", async (req, res) => {
   try {
 
     console.log("🔥 WEBHOOK:", JSON.stringify(req.body, null, 2));
-
+    console.log("SUB:", sub.status);
     const type = req.body.type;
     const id = req.body.data?.id;
 
