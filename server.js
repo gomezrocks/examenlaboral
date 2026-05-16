@@ -142,7 +142,6 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    console.log("TYPE:", type);
     console.log("ID:", id);
     // 🔥 CONSULTAR SUSCRIPCIÓN
     const response = await fetch(
