@@ -46,6 +46,7 @@ app.post("/crear-suscripcion", async (req, res) => {
     }
 
     const payload = {
+
       reason: "Suscripción PRO WebHoy",
 
       auto_recurring: {
@@ -57,9 +58,16 @@ app.post("/crear-suscripcion", async (req, res) => {
 
       payer_email: email,
 
+      // usuario vuelve aquí
       back_url: `${BASE_URL}/gracias.html`,
 
-      external_reference: user_id
+      // MercadoPago avisará al servidor
+      notification_url:
+        `${BASE_URL}/webhook`,
+
+      external_reference:
+        user_id
+
     };
 
     console.log(
@@ -121,10 +129,13 @@ app.post("/crear-suscripcion", async (req, res) => {
 app.post("/webhook", async (req, res) => {
   try {
 
-    console.log("🔥 WEBHOOK:", JSON.stringify(req.body, null, 2));
-    console.log("SUB:", sub.status);
-    const type = req.body.type;
-    const id = req.body.data?.id;
+    console.log(
+      "🔥 WEBHOOK:",
+      JSON.stringify(req.body, null, 2)
+    );
+
+    const id =
+      req.body.data?.id;
 
     if (!id) {
       console.log("❌ Sin ID");
@@ -143,10 +154,13 @@ app.post("/webhook", async (req, res) => {
       }
     );
 
-    const sub = await response.json();
+    const sub =
+      await response.json();
 
-    console.log("SUB:", sub.status);
-
+    console.log(
+      "SUB STATUS:",
+      sub.status
+    );
     const userId = sub.external_reference;
 
     if (!userId) return res.sendStatus(200);
