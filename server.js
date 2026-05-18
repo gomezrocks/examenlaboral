@@ -59,7 +59,7 @@ app.post("/crear-suscripcion", async (req, res) => {
       payer_email: email,
 
       // usuario vuelve aquí
-     back_url:"pruebalaboral://premium",
+      back_url: `${BASE_URL}/gracias.html`,
 
       // MercadoPago avisará al servidor
       notification_url:
