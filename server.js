@@ -52,7 +52,7 @@ app.post("/crear-suscripcion", async (req, res) => {
       auto_recurring: {
         frequency: 1,
         frequency_type: "months",
-        transaction_amount: 990,
+        transaction_amount: 9990,
         currency_id: "CLP"
       },
 
