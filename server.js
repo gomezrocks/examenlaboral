@@ -37,6 +37,11 @@ const PRODUCTS = {
 };
 
 const ONE_TIME_PLANS = {
+  prueba_dia: {
+    label: "1 dia",
+    amount: 990,
+    days: 1
+  },
   un_mes: {
     label: "1 mes",
     amount: 12990,
@@ -53,6 +58,21 @@ const ONE_TIME_PLANS = {
     months: 12
   }
 };
+
+const PLAN_ALIASES = {
+  "prueba-dia": "prueba_dia",
+  un_dia: "prueba_dia",
+  dia: "prueba_dia",
+  "1_dia": "prueba_dia",
+  "1-dia": "prueba_dia",
+  "un-mes": "un_mes",
+  "tres-meses": "tres_meses"
+};
+
+function normalizePlanId(plan) {
+  const rawPlan = String(plan || "").trim();
+  return PLAN_ALIASES[rawPlan] || rawPlan;
+}
 
 function productConfig(productId = DEFAULT_PRODUCT_ID) {
   return PRODUCTS[productId] || PRODUCTS[DEFAULT_PRODUCT_ID];
@@ -135,9 +155,18 @@ function addMonths(date, months) {
   return copy;
 }
 
+function addPlanDuration(date, plan) {
+  const copy = new Date(date);
+  if (plan.days) {
+    copy.setDate(copy.getDate() + plan.days);
+    return copy;
+  }
+  return addMonths(copy, plan.months || 0);
+}
+
 function planFromPayment(payment) {
   const amount = Math.round(Number(payment.transaction_amount || 0));
-  const metadataPlan = payment.metadata?.plan;
+  const metadataPlan = normalizePlanId(payment.metadata?.plan);
   if (metadataPlan && ONE_TIME_PLANS[metadataPlan]) {
     return {
       id: metadataPlan,
@@ -300,7 +329,8 @@ app.post("/crear-pago", async (req, res) => {
   try {
     const { email, user_id, plan } = req.body;
     const config = productFromRequest(req.body);
-    const selectedPlan = ONE_TIME_PLANS[plan];
+    const normalizedPlan = normalizePlanId(plan);
+    const selectedPlan = ONE_TIME_PLANS[normalizedPlan];
 
     console.log("=================================");
     console.log("CREANDO PAGO UNICO CHECKOUT PRO");
@@ -308,12 +338,19 @@ app.post("/crear-pago", async (req, res) => {
     console.log("EMAIL:", email);
     console.log("USER ID:", user_id);
     console.log("PLAN:", plan);
+    console.log("PLAN NORMALIZADO:", normalizedPlan);
     console.log("BASE URL:", BASE_URL);
     console.log("=================================");
 
     if (!email || !user_id || !selectedPlan) {
       return res.status(400).json({
         error: "Faltan datos o plan invalido",
+        recibido: {
+          email: Boolean(email),
+          user_id: Boolean(user_id),
+          plan
+        },
+        plan_normalizado: normalizedPlan,
         planes_disponibles: Object.keys(ONE_TIME_PLANS)
       });
     }
@@ -349,7 +386,7 @@ app.post("/crear-pago", async (req, res) => {
       metadata: {
         product_id: config.id,
         product_name: config.name,
-        plan
+        plan: normalizedPlan
       }
     };
 
@@ -434,7 +471,7 @@ app.post("/webhook", async (req, res) => {
         paymentId: id,
         paymentStatus: resource.status,
         premiumSince: new Date(),
-        premiumUntil: addMonths(new Date(), selectedPlan.months),
+        premiumUntil: addPlanDuration(new Date(), selectedPlan),
         autoRenew: false
       });
 
