@@ -78,8 +78,24 @@ function productConfig(productId = DEFAULT_PRODUCT_ID) {
   return PRODUCTS[productId] || PRODUCTS[DEFAULT_PRODUCT_ID];
 }
 
-function productFromRequest(body = {}) {
-  return productConfig(body.product || body.product_id || body.productId);
+function inferProductFromRequest(req) {
+  const body = req.body || {};
+  const explicitProduct = body.product || body.product_id || body.productId;
+  if (explicitProduct) return explicitProduct;
+
+  const origin = String(req.get("origin") || "");
+  const referer = String(req.get("referer") || req.get("referrer") || "");
+  const source = `${origin} ${referer}`.toLowerCase();
+
+  if (source.includes("paes.apruebatodo.cl")) return "paes";
+  if (source.includes("apruebatodo.cl") && source.includes("paes")) return "paes";
+  if (source.includes("examenlaboral") || source.includes("fineslaborales")) return "finesLaborales";
+
+  return DEFAULT_PRODUCT_ID;
+}
+
+function productFromRequest(req) {
+  return productConfig(inferProductFromRequest(req));
 }
 
 function externalReference(productId, userId) {
@@ -134,14 +150,30 @@ async function findUserByEmail(email, preferredConfig) {
   return null;
 }
 
+async function correctProductByExistingUser(config, userId) {
+  if (!userId) return config;
+
+  const currentDoc = await db.collection(config.collection).doc(userId).get();
+  if (currentDoc.exists) return config;
+
+  for (const candidate of Object.values(PRODUCTS)) {
+    if (candidate.id === config.id) continue;
+    const candidateDoc = await db.collection(candidate.collection).doc(userId).get();
+    if (candidateDoc.exists) return candidate;
+  }
+
+  return config;
+}
+
 async function resolvePaidUser(resource, tokenConfig) {
   const metadataProductId = resource?.metadata?.product_id;
   const metadataUserId = resource?.metadata?.user_id || resource?.metadata?.uid;
   const parsedReference = parseExternalReference(resource?.external_reference, tokenConfig.id);
-  const config = productConfig(metadataProductId || parsedReference.productId || tokenConfig.id);
+  let config = productConfig(metadataProductId || parsedReference.productId || tokenConfig.id);
   const userId = metadataUserId || parsedReference.userId;
 
   if (userId) {
+    config = await correctProductByExistingUser(config, userId);
     return { config, userId };
   }
 
@@ -333,13 +365,15 @@ async function deactivateProduct(config, userId, data = {}) {
 app.post("/crear-suscripcion", async (req, res) => {
   try {
     const { email, user_id } = req.body;
-    const config = productFromRequest(req.body);
+    const config = productFromRequest(req);
 
     console.log("=================================");
     console.log("CREANDO SUSCRIPCION");
     console.log("PRODUCTO:", config.id);
     console.log("EMAIL:", email);
     console.log("USER ID:", user_id);
+    console.log("ORIGIN:", req.get("origin") || "");
+    console.log("REFERER:", req.get("referer") || req.get("referrer") || "");
     console.log("BASE URL:", BASE_URL);
     console.log("TOKEN:", config.token ? `${config.token.substring(0, 15)}...` : "NO TOKEN");
     console.log("=================================");
@@ -395,7 +429,8 @@ app.post("/crear-suscripcion", async (req, res) => {
     }
 
     res.json({
-      init_point: data.init_point
+      init_point: data.init_point,
+      product: config.id
     });
   } catch (err) {
     console.error("ERROR CREAR SUSCRIPCION:");
@@ -412,7 +447,7 @@ app.post("/crear-suscripcion", async (req, res) => {
 app.post("/crear-pago", async (req, res) => {
   try {
     const { email, user_id, plan } = req.body;
-    const config = productFromRequest(req.body);
+    const config = productFromRequest(req);
     const normalizedPlan = normalizePlanId(plan);
     const selectedPlan = ONE_TIME_PLANS[normalizedPlan];
 
@@ -423,6 +458,8 @@ app.post("/crear-pago", async (req, res) => {
     console.log("USER ID:", user_id);
     console.log("PLAN:", plan);
     console.log("PLAN NORMALIZADO:", normalizedPlan);
+    console.log("ORIGIN:", req.get("origin") || "");
+    console.log("REFERER:", req.get("referer") || req.get("referrer") || "");
     console.log("BASE URL:", BASE_URL);
     console.log("=================================");
 
@@ -496,7 +533,9 @@ app.post("/crear-pago", async (req, res) => {
 
     res.json({
       init_point: data.init_point,
-      preference_id: data.id
+      preference_id: data.id,
+      product: config.id,
+      plan: normalizedPlan
     });
   } catch (err) {
     console.error("ERROR CREAR PAGO UNICO:");
@@ -725,7 +764,7 @@ app.get("/premium/:user_id", async (req, res) => {
 app.post("/cancelar-suscripcion", async (req, res) => {
   try {
     const { user_id } = req.body;
-    const config = productFromRequest(req.body);
+    const config = productFromRequest(req);
 
     if (!user_id) {
       return res.status(400).json({ error: "Falta user_id" });
