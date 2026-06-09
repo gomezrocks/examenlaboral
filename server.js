@@ -10,6 +10,8 @@ app.use(express.json());
 // 🔐 ENV
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
+const PRODUCT_ID = "finesLaborales";
+const PRODUCT_NAME = "Fines Laborales";
 
 // =============================
 // 🚀 CREAR SUSCRIPCIÓN
@@ -47,7 +49,7 @@ app.post("/crear-suscripcion", async (req, res) => {
 
     const payload = {
 
-      reason: "Suscripción PRO WebHoy",
+      reason: `Suscripción Pro ${PRODUCT_NAME} - ApruebaTodo`,
 
       auto_recurring: {
         frequency: 1,
@@ -170,9 +172,17 @@ app.post("/webhook", async (req, res) => {
     if (sub.status === "authorized" || sub.status === "active"){
 
       await db.collection("users").doc(userId).set({
-        premium: true,
-        subscriptionId: id,
-        premiumSince: new Date()
+        products: {
+          [PRODUCT_ID]: {
+            premium: true,
+            plan: "suscripcion_mensual",
+            subscriptionId: id,
+            subscriptionStatus: sub.status,
+            premiumSince: new Date(),
+            premiumUntil: null,
+            updatedAt: new Date()
+          }
+        }
       }, { merge: true });
 
       console.log("🔥 PREMIUM ACTIVADO:", userId);
@@ -183,9 +193,16 @@ app.post("/webhook", async (req, res) => {
     // =============================
     if (["paused", "cancelled"].includes(sub.status)) {
 
-      await db.collection("users").doc(userId).update({
-        premium: false
-      });
+      await db.collection("users").doc(userId).set({
+        products: {
+          [PRODUCT_ID]: {
+            premium: false,
+            subscriptionId: id,
+            subscriptionStatus: sub.status,
+            updatedAt: new Date()
+          }
+        }
+      }, { merge: true });
 
       console.log("❌ PREMIUM DESACTIVADO:", userId);
     }
@@ -206,6 +223,36 @@ app.get("/", (req, res) => {
 });
 
 // =============================
+// ⭐ CONSULTAR PREMIUM
+// =============================
+app.get("/premium/:user_id", async (req, res) => {
+  try {
+    const { user_id } = req.params;
+
+    if (!user_id) {
+      return res.status(400).json({ error: "Falta user_id" });
+    }
+
+    const userDoc = await db.collection("users").doc(user_id).get();
+    const product = userDoc.exists
+      ? userDoc.data()?.products?.[PRODUCT_ID]
+      : null;
+
+    res.json({
+      product: PRODUCT_ID,
+      premium: Boolean(product?.premium),
+      plan: product?.plan || "free",
+      subscriptionStatus: product?.subscriptionStatus || null,
+      premiumUntil: product?.premiumUntil || null
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error consultando premium" });
+  }
+});
+
+// =============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor corriendo en puerto", PORT);
@@ -223,7 +270,7 @@ app.post("/cancelar-suscripcion", async (req, res) => {
       return res.status(404).json({ error: "Usuario no existe" });
     }
 
-    const subId = userDoc.data().subscriptionId;
+    const subId = userDoc.data()?.products?.[PRODUCT_ID]?.subscriptionId;
 
     if (!subId) {
       return res.status(400).json({ error: "No tiene suscripción" });
@@ -240,9 +287,15 @@ app.post("/cancelar-suscripcion", async (req, res) => {
       })
     });
 
-    await db.collection("users").doc(user_id).update({
-      premium: false
-    });
+    await db.collection("users").doc(user_id).set({
+      products: {
+        [PRODUCT_ID]: {
+          premium: false,
+          subscriptionStatus: "cancelled",
+          updatedAt: new Date()
+        }
+      }
+    }, { merge: true });
 
     res.json({ ok: true });
 
