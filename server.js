@@ -1,17 +1,31 @@
 import express from "express";
 import cors from "cors";
-import crypto from "crypto";
 import { db } from "./firebase.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 ENV
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const BASE_URL = process.env.BASE_URL; // ej: https://tu-app.onrender.com
-const PRODUCT_ID = "finesLaborales";
-const PRODUCT_NAME = "Fines Laborales";
+const BASE_URL = process.env.BASE_URL; // ej: https://examenlaboral.onrender.com
+const DEFAULT_PRODUCT_ID = "finesLaborales";
+
+const PRODUCTS = {
+  finesLaborales: {
+    id: "finesLaborales",
+    name: "Fines Laborales",
+    collection: "users",
+    token:
+      process.env.MP_ACCESS_TOKEN_FINES ||
+      process.env.MP_ACCESS_TOKEN_FINESLABORALES ||
+      process.env.MP_ACCESS_TOKEN
+  },
+  paes: {
+    id: "paes",
+    name: "PAES",
+    collection: "paesUsers",
+    token: process.env.MP_ACCESS_TOKEN_PAES || process.env.MP_ACCESS_TOKEN
+  }
+};
 
 const ONE_TIME_PLANS = {
   un_mes: {
@@ -30,6 +44,72 @@ const ONE_TIME_PLANS = {
     months: 12
   }
 };
+
+function productConfig(productId = DEFAULT_PRODUCT_ID) {
+  return PRODUCTS[productId] || PRODUCTS[DEFAULT_PRODUCT_ID];
+}
+
+function productFromRequest(body = {}) {
+  return productConfig(body.product || body.product_id || body.productId);
+}
+
+function externalReference(productId, userId) {
+  return `${productId}:${userId}`;
+}
+
+function parseExternalReference(value, fallbackProductId = DEFAULT_PRODUCT_ID) {
+  const reference = String(value || "");
+  if (reference.includes(":")) {
+    const [productId, ...rest] = reference.split(":");
+    return {
+      productId: PRODUCTS[productId] ? productId : fallbackProductId,
+      userId: rest.join(":")
+    };
+  }
+
+  return {
+    productId: fallbackProductId,
+    userId: reference
+  };
+}
+
+function tokenCandidates() {
+  const seen = new Set();
+  return Object.values(PRODUCTS).filter((config) => {
+    if (!config.token || seen.has(config.token)) return false;
+    seen.add(config.token);
+    return true;
+  });
+}
+
+async function fetchMercadoPagoResource(topic, id) {
+  const isPayment = String(topic).includes("payment");
+  const resourceUrl = isPayment
+    ? `https://api.mercadopago.com/v1/payments/${id}`
+    : `https://api.mercadopago.com/preapproval/${id}`;
+
+  for (const config of tokenCandidates()) {
+    const response = await fetch(resourceUrl, {
+      headers: {
+        Authorization: `Bearer ${config.token}`
+      }
+    });
+
+    if (response.ok) {
+      return {
+        config,
+        resource: await response.json(),
+        isPayment
+      };
+    }
+  }
+
+  return {
+    config: productConfig(),
+    resource: null,
+    isPayment
+  };
+}
 
 function addMonths(date, months) {
   const copy = new Date(date);
@@ -58,153 +138,155 @@ function planFromPayment(payment) {
   };
 }
 
-async function activateProduct(userId, data) {
-  await db.collection("users").doc(userId).set({
+function paesMembership(data, premium) {
+  if (!premium) {
+    return {
+      plan: "free",
+      provider: "mercadopago",
+      paymentStatus: data.paymentStatus || data.subscriptionStatus || "cancelled",
+      validUntil: data.premiumUntil || null,
+      updatedAt: new Date()
+    };
+  }
+
+  return {
+    plan: "pro",
+    provider: "mercadopago",
+    providerPlan: data.plan,
+    planLabel: data.planLabel,
+    autoRenew: Boolean(data.autoRenew),
+    paymentStatus: data.paymentStatus || data.subscriptionStatus || "approved",
+    validUntil: data.premiumUntil || null,
+    activatedAt: new Date(),
+    updatedAt: new Date()
+  };
+}
+
+async function activateProduct(config, userId, data) {
+  const update = {
     products: {
-      [PRODUCT_ID]: {
+      [config.id]: {
         premium: true,
         ...data,
         updatedAt: new Date()
       }
     }
-  }, { merge: true });
+  };
+
+  if (config.id === "paes") {
+    update.membership = paesMembership(data, true);
+  }
+
+  await db.collection(config.collection).doc(userId).set(update, { merge: true });
 }
 
-async function deactivateProduct(userId, data = {}) {
-  await db.collection("users").doc(userId).set({
+async function deactivateProduct(config, userId, data = {}) {
+  const update = {
     products: {
-      [PRODUCT_ID]: {
+      [config.id]: {
         premium: false,
         ...data,
         updatedAt: new Date()
       }
     }
-  }, { merge: true });
+  };
+
+  if (config.id === "paes") {
+    update.membership = paesMembership(data, false);
+  }
+
+  await db.collection(config.collection).doc(userId).set(update, { merge: true });
 }
 
 // =============================
-// 🚀 CREAR SUSCRIPCIÓN
-// =============================
-// =============================
-// 🚀 CREAR SUSCRIPCIÓN
+// CREAR SUSCRIPCION
 // =============================
 app.post("/crear-suscripcion", async (req, res) => {
-
   try {
-
     const { email, user_id } = req.body;
+    const config = productFromRequest(req.body);
 
     console.log("=================================");
-    console.log("🚀 CREANDO SUSCRIPCIÓN");
+    console.log("CREANDO SUSCRIPCION");
+    console.log("PRODUCTO:", config.id);
     console.log("EMAIL:", email);
     console.log("USER ID:", user_id);
     console.log("BASE URL:", BASE_URL);
-    console.log(
-      "TOKEN:",
-      MP_ACCESS_TOKEN
-        ? MP_ACCESS_TOKEN.substring(0, 15) + "..."
-        : "NO TOKEN"
-    );
+    console.log("TOKEN:", config.token ? `${config.token.substring(0, 15)}...` : "NO TOKEN");
     console.log("=================================");
 
     if (!email || !user_id) {
-
-      console.log("❌ Faltan datos");
-
       return res.status(400).json({
         error: "Faltan datos"
       });
     }
 
+    if (!config.token) {
+      return res.status(500).json({
+        error: `Falta token de Mercado Pago para ${config.id}`
+      });
+    }
+
     const payload = {
-
-      reason: `Suscripción Pro ${PRODUCT_NAME} - ApruebaTodo`,
-
+      reason: `Suscripcion Pro ${config.name} - ApruebaTodo`,
       auto_recurring: {
         frequency: 1,
         frequency_type: "months",
         transaction_amount: 9990,
         currency_id: "CLP"
       },
-
       payer_email: email,
-
-      // usuario vuelve aquí
       back_url: `${BASE_URL}/gracias.html`,
-
-      // MercadoPago avisará al servidor
-      notification_url:
-        `${BASE_URL}/webhook`,
-
-      external_reference:
-        user_id
-
+      notification_url: `${BASE_URL}/webhook`,
+      external_reference: externalReference(config.id, user_id),
+      metadata: {
+        product_id: config.id,
+        product_name: config.name
+      }
     };
 
-    console.log(
-      "📦 PAYLOAD:",
-      JSON.stringify(payload, null, 2)
-    );
-
-    const response = await fetch(
-      "https://api.mercadopago.com/preapproval",
-      {
-        method: "POST",
-
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-
-        body: JSON.stringify(payload)
-      }
-    );
-
-    console.log("🔥 MP STATUS:", response.status);
+    const response = await fetch("https://api.mercadopago.com/preapproval", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
 
     const data = await response.json();
 
-    console.log(
-      "🔥 MP RESPONSE:",
-      JSON.stringify(data, null, 2)
-    );
+    console.log("MP STATUS:", response.status);
+    console.log("MP RESPONSE:", JSON.stringify(data, null, 2));
 
     if (!data.init_point) {
-
-      console.log("❌ No viene init_point");
-
-      return res.status(500).json({
-        error: data
-      });
+      return res.status(500).json({ error: data });
     }
-
-    console.log("✅ SUSCRIPCIÓN CREADA");
 
     res.json({
       init_point: data.init_point
     });
-
   } catch (err) {
-
-    console.error("❌ ERROR CREAR SUSCRIPCIÓN:");
+    console.error("ERROR CREAR SUSCRIPCION:");
     console.error(err);
-
     res.status(500).json({
-      error: "Error creando suscripción"
+      error: "Error creando suscripcion"
     });
   }
 });
 
 // =============================
-// 💳 CREAR PAGO ÚNICO CHECKOUT PRO
+// CREAR PAGO UNICO CHECKOUT PRO
 // =============================
 app.post("/crear-pago", async (req, res) => {
   try {
     const { email, user_id, plan } = req.body;
+    const config = productFromRequest(req.body);
     const selectedPlan = ONE_TIME_PLANS[plan];
 
     console.log("=================================");
-    console.log("💳 CREANDO PAGO ÚNICO CHECKOUT PRO");
+    console.log("CREANDO PAGO UNICO CHECKOUT PRO");
+    console.log("PRODUCTO:", config.id);
     console.log("EMAIL:", email);
     console.log("USER ID:", user_id);
     console.log("PLAN:", plan);
@@ -213,17 +295,23 @@ app.post("/crear-pago", async (req, res) => {
 
     if (!email || !user_id || !selectedPlan) {
       return res.status(400).json({
-        error: "Faltan datos o plan inválido",
+        error: "Faltan datos o plan invalido",
         planes_disponibles: Object.keys(ONE_TIME_PLANS)
+      });
+    }
+
+    if (!config.token) {
+      return res.status(500).json({
+        error: `Falta token de Mercado Pago para ${config.id}`
       });
     }
 
     const payload = {
       items: [
         {
-          id: `${PRODUCT_ID}-${plan}`,
-          title: `${PRODUCT_NAME} Pro - ${selectedPlan.label}`,
-          description: `Acceso Pro ${PRODUCT_NAME} por ${selectedPlan.label}`,
+          id: `${config.id}-${plan}`,
+          title: `${config.name} Pro - ${selectedPlan.label}`,
+          description: `Acceso Pro ${config.name} por ${selectedPlan.label}`,
           quantity: 1,
           currency_id: "CLP",
           unit_price: selectedPlan.amount
@@ -239,30 +327,27 @@ app.post("/crear-pago", async (req, res) => {
       },
       auto_return: "approved",
       notification_url: `${BASE_URL}/webhook`,
-      external_reference: user_id,
+      external_reference: externalReference(config.id, user_id),
       metadata: {
-        product_id: PRODUCT_ID,
-        product_name: PRODUCT_NAME,
+        product_id: config.id,
+        product_name: config.name,
         plan
       }
     };
 
-    const response = await fetch(
-      "https://api.mercadopago.com/checkout/preferences",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload)
-      }
-    );
+    const response = await fetch("https://api.mercadopago.com/checkout/preferences", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
 
     const data = await response.json();
 
-    console.log("🔥 MP PREFERENCE STATUS:", response.status);
-    console.log("🔥 MP PREFERENCE RESPONSE:", JSON.stringify(data, null, 2));
+    console.log("MP PREFERENCE STATUS:", response.status);
+    console.log("MP PREFERENCE RESPONSE:", JSON.stringify(data, null, 2));
 
     if (!data.init_point) {
       return res.status(500).json({ error: data });
@@ -272,74 +357,60 @@ app.post("/crear-pago", async (req, res) => {
       init_point: data.init_point,
       preference_id: data.id
     });
-
   } catch (err) {
-    console.error("❌ ERROR CREAR PAGO ÚNICO:");
+    console.error("ERROR CREAR PAGO UNICO:");
     console.error(err);
-    res.status(500).json({ error: "Error creando pago único" });
+    res.status(500).json({ error: "Error creando pago unico" });
   }
 });
+
 // =============================
-// 🔔 WEBHOOK MERCADOPAGO
+// WEBHOOK MERCADOPAGO
 // =============================
 app.post("/webhook", async (req, res) => {
   try {
-
-    console.log(
-      "🔥 WEBHOOK:",
-      JSON.stringify(req.body, null, 2)
-    );
+    console.log("WEBHOOK:", JSON.stringify(req.body, null, 2));
 
     const id = req.body.data?.id || req.query["data.id"] || req.query.id;
     const topic = req.body.type || req.query.type || req.body.topic || req.query.topic || "preapproval";
 
     if (!id) {
-      console.log("❌ Sin ID");
+      console.log("Sin ID");
+      return res.sendStatus(200);
+    }
+
+    const { config: tokenConfig, resource, isPayment } = await fetchMercadoPagoResource(topic, id);
+
+    if (!resource) {
+      console.log("No se pudo consultar recurso en Mercado Pago:", id);
       return res.sendStatus(200);
     }
 
     console.log("ID:", id);
     console.log("TOPIC:", topic);
+    console.log("RESOURCE STATUS:", resource.status);
 
-    const isPayment = String(topic).includes("payment");
-    const resourceUrl = isPayment
-      ? `https://api.mercadopago.com/v1/payments/${id}`
-      : `https://api.mercadopago.com/preapproval/${id}`;
-
-    const response = await fetch(
-      resourceUrl,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`
-        }
-      }
-    );
-
-    const resource = await response.json();
-
-    console.log(
-      "RESOURCE STATUS:",
-      resource.status
-    );
-
-    const userId = resource.external_reference;
+    const metadataProductId = resource.metadata?.product_id;
+    const parsedReference = parseExternalReference(resource.external_reference, tokenConfig.id);
+    const config = productConfig(metadataProductId || parsedReference.productId || tokenConfig.id);
+    const userId = parsedReference.userId;
 
     if (!userId) return res.sendStatus(200);
 
     if (isPayment) {
       if (resource.status !== "approved") {
-        console.log("⏳ PAGO NO APROBADO:", resource.status);
+        console.log("PAGO NO APROBADO:", resource.status);
         return res.sendStatus(200);
       }
 
       const selectedPlan = planFromPayment(resource);
 
       if (!selectedPlan) {
-        console.log("❌ No se pudo inferir plan por monto:", resource.transaction_amount);
+        console.log("No se pudo inferir plan por monto:", resource.transaction_amount);
         return res.sendStatus(200);
       }
 
-      await activateProduct(userId, {
+      await activateProduct(config, userId, {
         plan: selectedPlan.id,
         planLabel: selectedPlan.label,
         paymentId: id,
@@ -349,16 +420,12 @@ app.post("/webhook", async (req, res) => {
         autoRenew: false
       });
 
-      console.log("🔥 PREMIUM PAGO ÚNICO ACTIVADO:", userId, selectedPlan.id);
+      console.log("PREMIUM PAGO UNICO ACTIVADO:", config.id, userId, selectedPlan.id);
       return res.sendStatus(200);
     }
 
-    // =============================
-    // 🟢 ACTIVA
-    // =============================
-    if (resource.status === "authorized" || resource.status === "active"){
-
-      await activateProduct(userId, {
+    if (resource.status === "authorized" || resource.status === "active") {
+      await activateProduct(config, userId, {
         plan: "suscripcion_mensual",
         planLabel: "$9.990 / mes",
         subscriptionId: id,
@@ -368,24 +435,19 @@ app.post("/webhook", async (req, res) => {
         autoRenew: true
       });
 
-      console.log("🔥 PREMIUM ACTIVADO:", userId);
+      console.log("PREMIUM ACTIVADO:", config.id, userId);
     }
 
-    // =============================
-    // 🔴 CANCELADA / PAUSADA
-    // =============================
     if (["paused", "cancelled"].includes(resource.status)) {
-
-      await deactivateProduct(userId, {
+      await deactivateProduct(config, userId, {
         subscriptionId: id,
         subscriptionStatus: resource.status
       });
 
-      console.log("❌ PREMIUM DESACTIVADO:", userId);
+      console.log("PREMIUM DESACTIVADO:", config.id, userId);
     }
 
     res.sendStatus(200);
-
   } catch (err) {
     console.error(err);
     res.sendStatus(500);
@@ -393,30 +455,27 @@ app.post("/webhook", async (req, res) => {
 });
 
 // =============================
-// ❤️ HEALTH CHECK
+// HEALTH CHECK
 // =============================
 app.get("/", (req, res) => {
-  res.send("Servidor OK 🚀");
+  res.send("Servidor OK");
 });
 
-// =============================
-// ⭐ CONSULTAR PREMIUM
-// =============================
-app.get("/premium/:user_id", async (req, res) => {
+async function premiumResponse(req, res, productId, userId) {
   try {
-    const { user_id } = req.params;
+    const config = productConfig(productId);
 
-    if (!user_id) {
+    if (!userId) {
       return res.status(400).json({ error: "Falta user_id" });
     }
 
-    const userDoc = await db.collection("users").doc(user_id).get();
+    const userDoc = await db.collection(config.collection).doc(userId).get();
     const product = userDoc.exists
-      ? userDoc.data()?.products?.[PRODUCT_ID]
+      ? userDoc.data()?.products?.[config.id]
       : null;
 
     res.json({
-      product: PRODUCT_ID,
+      product: config.id,
       premium: Boolean(product?.premium),
       plan: product?.plan || "free",
       planLabel: product?.planLabel || null,
@@ -426,41 +485,59 @@ app.get("/premium/:user_id", async (req, res) => {
       premiumSince: product?.premiumSince || null,
       premiumUntil: product?.premiumUntil || null
     });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error consultando premium" });
   }
+}
+
+// =============================
+// CONSULTAR PREMIUM
+// =============================
+app.get("/premium/:product_id/:user_id", async (req, res) => {
+  const { product_id, user_id } = req.params;
+  await premiumResponse(req, res, product_id, user_id);
+});
+
+app.get("/premium/:user_id", async (req, res) => {
+  const { user_id } = req.params;
+  await premiumResponse(req, res, DEFAULT_PRODUCT_ID, user_id);
 });
 
 // =============================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Servidor corriendo en puerto", PORT);
-});
-
-//CANCELAR SUSCRIPCIÓN
+// CANCELAR SUSCRIPCION
+// =============================
 app.post("/cancelar-suscripcion", async (req, res) => {
   try {
-
     const { user_id } = req.body;
+    const config = productFromRequest(req.body);
 
-    const userDoc = await db.collection("users").doc(user_id).get();
+    if (!user_id) {
+      return res.status(400).json({ error: "Falta user_id" });
+    }
+
+    if (!config.token) {
+      return res.status(500).json({
+        error: `Falta token de Mercado Pago para ${config.id}`
+      });
+    }
+
+    const userDoc = await db.collection(config.collection).doc(user_id).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({ error: "Usuario no existe" });
     }
 
-    const subId = userDoc.data()?.products?.[PRODUCT_ID]?.subscriptionId;
+    const subId = userDoc.data()?.products?.[config.id]?.subscriptionId;
 
     if (!subId) {
-      return res.status(400).json({ error: "No tiene suscripción" });
+      return res.status(400).json({ error: "No tiene suscripcion" });
     }
 
     await fetch(`https://api.mercadopago.com/preapproval/${subId}`, {
       method: "PUT",
       headers: {
-        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${config.token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -468,20 +545,18 @@ app.post("/cancelar-suscripcion", async (req, res) => {
       })
     });
 
-    await db.collection("users").doc(user_id).set({
-      products: {
-        [PRODUCT_ID]: {
-          premium: false,
-          subscriptionStatus: "cancelled",
-          updatedAt: new Date()
-        }
-      }
-    }, { merge: true });
+    await deactivateProduct(config, user_id, {
+      subscriptionStatus: "cancelled"
+    });
 
     res.json({ ok: true });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error cancelando" });
   }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Servidor corriendo en puerto", PORT);
 });
