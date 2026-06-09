@@ -14,6 +14,11 @@ const PRODUCTS = {
     id: "finesLaborales",
     name: "Fines Laborales",
     collection: "users",
+    returnUrl:
+      process.env.FINES_APP_URL ||
+      process.env.FINES_LABORALES_APP_URL ||
+      process.env.APP_URL_FINES ||
+      BASE_URL,
     token:
       process.env.MP_ACCESS_TOKEN_FINES ||
       process.env.MP_ACCESS_TOKEN_FINESLABORALES ||
@@ -23,6 +28,10 @@ const PRODUCTS = {
     id: "paes",
     name: "PAES",
     collection: "paesUsers",
+    returnUrl:
+      process.env.PAES_APP_URL ||
+      process.env.APP_URL_PAES ||
+      "https://paes.apruebatodo.cl",
     token: process.env.MP_ACCESS_TOKEN_PAES || process.env.MP_ACCESS_TOKEN
   }
 };
@@ -80,6 +89,15 @@ function tokenCandidates() {
     seen.add(config.token);
     return true;
   });
+}
+
+function appReturnUrl(config, status = "success") {
+  const base = String(config.returnUrl || BASE_URL || "").replace(/\/$/, "");
+  const query = new URLSearchParams({
+    pago: status,
+    producto: config.id
+  });
+  return `${base}/?${query.toString()}`;
 }
 
 async function fetchMercadoPagoResource(topic, id) {
@@ -236,7 +254,7 @@ app.post("/crear-suscripcion", async (req, res) => {
         currency_id: "CLP"
       },
       payer_email: email,
-      back_url: `${BASE_URL}/gracias.html`,
+      back_url: appReturnUrl(config, "ok"),
       notification_url: `${BASE_URL}/webhook`,
       external_reference: externalReference(config.id, user_id),
       metadata: {
@@ -321,9 +339,9 @@ app.post("/crear-pago", async (req, res) => {
         email
       },
       back_urls: {
-        success: `${BASE_URL}/gracias.html`,
-        failure: `${BASE_URL}/pago-error.html`,
-        pending: `${BASE_URL}/pago-pendiente.html`
+        success: appReturnUrl(config, "ok"),
+        failure: appReturnUrl(config, "error"),
+        pending: appReturnUrl(config, "pendiente")
       },
       auto_return: "approved",
       notification_url: `${BASE_URL}/webhook`,
