@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { db } from "./firebase.js";
+import { dbForProduct } from "./firebase.js";
 
 const app = express();
 app.use(cors());
@@ -78,6 +78,10 @@ function productConfig(productId = DEFAULT_PRODUCT_ID) {
   return PRODUCTS[productId] || PRODUCTS[DEFAULT_PRODUCT_ID];
 }
 
+function dbForConfig(config) {
+  return dbForProduct(config.id);
+}
+
 function inferProductFromRequest(req) {
   const body = req.body || {};
   const explicitProduct = body.product || body.product_id || body.productId;
@@ -134,7 +138,7 @@ async function findUserByEmail(email, preferredConfig) {
   ].filter(Boolean);
 
   for (const config of configs) {
-    const snapshot = await db.collection(config.collection)
+    const snapshot = await dbForConfig(config).collection(config.collection)
       .where("email", "==", email)
       .limit(1)
       .get();
@@ -153,12 +157,12 @@ async function findUserByEmail(email, preferredConfig) {
 async function correctProductByExistingUser(config, userId) {
   if (!userId) return config;
 
-  const currentDoc = await db.collection(config.collection).doc(userId).get();
+  const currentDoc = await dbForConfig(config).collection(config.collection).doc(userId).get();
   if (currentDoc.exists) return config;
 
   for (const candidate of Object.values(PRODUCTS)) {
     if (candidate.id === config.id) continue;
-    const candidateDoc = await db.collection(candidate.collection).doc(userId).get();
+    const candidateDoc = await dbForConfig(candidate).collection(candidate.collection).doc(userId).get();
     if (candidateDoc.exists) return candidate;
   }
 
@@ -263,6 +267,35 @@ async function fetchMercadoPagoResource(topic, id) {
   };
 }
 
+async function findApprovedPaymentByExternalReference(config, reference) {
+  if (!config.token || !reference) return null;
+
+  const searchUrl = `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(reference)}&sort=date_created&criteria=desc`;
+  const response = await fetch(searchUrl, {
+    headers: {
+      Authorization: `Bearer ${config.token}`
+    }
+  });
+
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  const results = Array.isArray(data.results) ? data.results : [];
+  const paymentSummary = results.find((payment) => payment.status === "approved") || results[0];
+
+  if (!paymentSummary?.id) return null;
+
+  const paymentResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentSummary.id}`, {
+    headers: {
+      Authorization: `Bearer ${config.token}`
+    }
+  });
+
+  if (!paymentResponse.ok) return null;
+
+  return paymentResponse.json();
+}
+
 function addMonths(date, months) {
   const copy = new Date(date);
   copy.setMonth(copy.getMonth() + months);
@@ -338,7 +371,7 @@ async function activateProduct(config, userId, data) {
     update.membership = paesMembership(data, true);
   }
 
-  await db.collection(config.collection).doc(userId).set(update, { merge: true });
+  await dbForConfig(config).collection(config.collection).doc(userId).set(update, { merge: true });
 }
 
 async function deactivateProduct(config, userId, data = {}) {
@@ -356,7 +389,7 @@ async function deactivateProduct(config, userId, data = {}) {
     update.membership = paesMembership(data, false);
   }
 
-  await db.collection(config.collection).doc(userId).set(update, { merge: true });
+  await dbForConfig(config).collection(config.collection).doc(userId).set(update, { merge: true });
 }
 
 // =============================
@@ -576,14 +609,36 @@ async function activateApprovedPayment(resource, tokenConfig, paymentId) {
     };
   }
 
-  const premiumUntil = addPlanDuration(new Date(), selectedPlan);
+  const paidAt = new Date(resource.date_approved || resource.date_created || Date.now());
+  const premiumUntil = addPlanDuration(paidAt, selectedPlan);
+
+  if (premiumUntil <= new Date()) {
+    await deactivateProduct(config, userId, {
+      plan: selectedPlan.id,
+      planLabel: selectedPlan.label,
+      paymentId,
+      paymentStatus: "expired",
+      premiumSince: paidAt,
+      premiumUntil,
+      autoRenew: false
+    });
+
+    return {
+      ok: false,
+      code: "payment_access_expired",
+      product: config.id,
+      user_id: userId,
+      plan: selectedPlan.id,
+      premiumUntil
+    };
+  }
 
   await activateProduct(config, userId, {
     plan: selectedPlan.id,
     planLabel: selectedPlan.label,
     paymentId,
     paymentStatus: resource.status,
-    premiumSince: new Date(),
+    premiumSince: paidAt,
     premiumUntil,
     autoRenew: false
   });
@@ -705,15 +760,18 @@ app.post("/confirmar-pago", async (req, res) => {
   try {
     const paymentId = req.body.payment_id || req.body.collection_id;
     const merchantOrderId = req.body.merchant_order_id;
+    const preferenceId = req.body.preference_id;
     const preapprovalId = req.body.preapproval_id || req.body.subscription_id;
     const config = productFromRequest(req);
+    const userId = req.body.user_id;
 
     console.log("CONFIRMAR PAGO:", {
       product: config.id,
       paymentId,
       merchantOrderId,
+      preferenceId,
       preapprovalId,
-      user_id: req.body.user_id || "",
+      user_id: userId || "",
       status: req.body.status || ""
     });
 
@@ -758,9 +816,26 @@ app.post("/confirmar-pago", async (req, res) => {
       return res.status(result.ok ? 200 : 400).json(result);
     }
 
+    if (preferenceId || userId) {
+      const reference = externalReference(config.id, userId);
+      const resource = await findApprovedPaymentByExternalReference(config, reference);
+
+      if (!resource) {
+        return res.status(404).json({
+          ok: false,
+          error: "No se encontro pago aprobado para este usuario",
+          preference_id: preferenceId || null,
+          external_reference: reference
+        });
+      }
+
+      const result = await activateApprovedPayment(resource, config, String(resource.id));
+      return res.status(result.ok ? 200 : 400).json(result);
+    }
+
     return res.status(400).json({
       ok: false,
-      error: "Falta payment_id, collection_id, merchant_order_id o preapproval_id"
+      error: "Falta payment_id, collection_id, merchant_order_id, preapproval_id, preference_id o user_id"
     });
   } catch (err) {
     console.error(err);
@@ -803,21 +878,28 @@ async function premiumResponse(req, res, productId, userId) {
       return res.status(400).json({ error: "Falta user_id" });
     }
 
-    const userDoc = await db.collection(config.collection).doc(userId).get();
+    const userDoc = await dbForConfig(config).collection(config.collection).doc(userId).get();
     const product = userDoc.exists
       ? userDoc.data()?.products?.[config.id]
       : null;
+    const premiumUntilDate = product?.premiumUntil?.toDate
+      ? product.premiumUntil.toDate()
+      : product?.premiumUntil
+        ? new Date(product.premiumUntil)
+        : null;
+    const isExpired = premiumUntilDate && premiumUntilDate <= new Date();
+    const premium = Boolean(product?.premium) && !isExpired;
 
     res.json({
       product: config.id,
-      premium: Boolean(product?.premium),
+      premium,
       plan: product?.plan || "free",
       planLabel: product?.planLabel || null,
       autoRenew: Boolean(product?.autoRenew),
       paymentStatus: product?.paymentStatus || null,
       subscriptionStatus: product?.subscriptionStatus || null,
       premiumSince: product?.premiumSince || null,
-      premiumUntil: product?.premiumUntil || null
+      premiumUntil: premiumUntilDate ? premiumUntilDate.toISOString() : null
     });
   } catch (err) {
     console.error(err);
@@ -856,7 +938,7 @@ app.post("/cancelar-suscripcion", async (req, res) => {
       });
     }
 
-    const userDoc = await db.collection(config.collection).doc(user_id).get();
+    const userDoc = await dbForConfig(config).collection(config.collection).doc(user_id).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({ error: "Usuario no existe" });
