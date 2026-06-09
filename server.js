@@ -544,6 +544,113 @@ app.post("/crear-pago", async (req, res) => {
   }
 });
 
+async function activateApprovedPayment(resource, tokenConfig, paymentId) {
+  if (resource.status !== "approved") {
+    return {
+      ok: false,
+      code: "payment_not_approved",
+      status: resource.status
+    };
+  }
+
+  const selectedPlan = planFromPayment(resource);
+
+  if (!selectedPlan) {
+    return {
+      ok: false,
+      code: "plan_not_found",
+      amount: resource.transaction_amount,
+      metadata: resource.metadata || null
+    };
+  }
+
+  const { config, userId } = await resolvePaidUser(resource, tokenConfig);
+
+  if (!userId) {
+    return {
+      ok: false,
+      code: "user_not_found",
+      external_reference: resource.external_reference || null,
+      metadata: resource.metadata || null,
+      email: paymentEmail(resource) || null
+    };
+  }
+
+  const premiumUntil = addPlanDuration(new Date(), selectedPlan);
+
+  await activateProduct(config, userId, {
+    plan: selectedPlan.id,
+    planLabel: selectedPlan.label,
+    paymentId,
+    paymentStatus: resource.status,
+    premiumSince: new Date(),
+    premiumUntil,
+    autoRenew: false
+  });
+
+  return {
+    ok: true,
+    product: config.id,
+    user_id: userId,
+    plan: selectedPlan.id,
+    premiumUntil
+  };
+}
+
+async function activateApprovedSubscription(resource, tokenConfig, subscriptionId) {
+  const { config, userId } = await resolvePaidUser(resource, tokenConfig);
+
+  if (!userId) {
+    return {
+      ok: false,
+      code: "user_not_found",
+      external_reference: resource.external_reference || null,
+      metadata: resource.metadata || null,
+      email: paymentEmail(resource) || null
+    };
+  }
+
+  if (resource.status === "authorized" || resource.status === "active") {
+    await activateProduct(config, userId, {
+      plan: "suscripcion_mensual",
+      planLabel: "$9.990 / mes",
+      subscriptionId,
+      subscriptionStatus: resource.status,
+      premiumSince: new Date(),
+      premiumUntil: null,
+      autoRenew: true
+    });
+
+    return {
+      ok: true,
+      product: config.id,
+      user_id: userId,
+      plan: "suscripcion_mensual"
+    };
+  }
+
+  if (["paused", "cancelled"].includes(resource.status)) {
+    await deactivateProduct(config, userId, {
+      subscriptionId,
+      subscriptionStatus: resource.status
+    });
+
+    return {
+      ok: true,
+      deactivated: true,
+      product: config.id,
+      user_id: userId,
+      status: resource.status
+    };
+  }
+
+  return {
+    ok: false,
+    code: "subscription_not_active",
+    status: resource.status
+  };
+}
+
 // =============================
 // WEBHOOK MERCADOPAGO
 // =============================
@@ -572,68 +679,14 @@ async function handleMercadoPagoWebhook(req, res) {
     console.log("TOPIC:", topic);
     console.log("RESOURCE STATUS:", resource.status);
 
-    const { config, userId } = await resolvePaidUser(resource, tokenConfig);
-
-    if (!userId) {
-      console.log("No se pudo resolver usuario del pago:", {
-        id,
-        topic,
-        external_reference: resource.external_reference,
-        metadata: resource.metadata || null,
-        email: paymentEmail(resource)
-      });
-      return res.sendStatus(200);
-    }
-
     if (isPayment) {
-      if (resource.status !== "approved") {
-        console.log("PAGO NO APROBADO:", resource.status);
-        return res.sendStatus(200);
-      }
-
-      const selectedPlan = planFromPayment(resource);
-
-      if (!selectedPlan) {
-        console.log("No se pudo inferir plan por monto:", resource.transaction_amount);
-        return res.sendStatus(200);
-      }
-
-      await activateProduct(config, userId, {
-        plan: selectedPlan.id,
-        planLabel: selectedPlan.label,
-        paymentId: id,
-        paymentStatus: resource.status,
-        premiumSince: new Date(),
-        premiumUntil: addPlanDuration(new Date(), selectedPlan),
-        autoRenew: false
-      });
-
-      console.log("PREMIUM PAGO UNICO ACTIVADO:", config.id, userId, selectedPlan.id);
+      const result = await activateApprovedPayment(resource, tokenConfig, id);
+      console.log("RESULTADO ACTIVACION PAGO:", result);
       return res.sendStatus(200);
     }
 
-    if (resource.status === "authorized" || resource.status === "active") {
-      await activateProduct(config, userId, {
-        plan: "suscripcion_mensual",
-        planLabel: "$9.990 / mes",
-        subscriptionId: id,
-        subscriptionStatus: resource.status,
-        premiumSince: new Date(),
-        premiumUntil: null,
-        autoRenew: true
-      });
-
-      console.log("PREMIUM ACTIVADO:", config.id, userId);
-    }
-
-    if (["paused", "cancelled"].includes(resource.status)) {
-      await deactivateProduct(config, userId, {
-        subscriptionId: id,
-        subscriptionStatus: resource.status
-      });
-
-      console.log("PREMIUM DESACTIVADO:", config.id, userId);
-    }
+    const result = await activateApprovedSubscription(resource, tokenConfig, id);
+    console.log("RESULTADO ACTIVACION SUSCRIPCION:", result);
 
     res.sendStatus(200);
   } catch (err) {
@@ -644,6 +697,76 @@ async function handleMercadoPagoWebhook(req, res) {
 
 app.post("/webhook", handleMercadoPagoWebhook);
 app.get("/webhook", handleMercadoPagoWebhook);
+
+// =============================
+// CONFIRMAR PAGO AL VOLVER A LA APP
+// =============================
+app.post("/confirmar-pago", async (req, res) => {
+  try {
+    const paymentId = req.body.payment_id || req.body.collection_id;
+    const merchantOrderId = req.body.merchant_order_id;
+    const preapprovalId = req.body.preapproval_id || req.body.subscription_id;
+    const config = productFromRequest(req);
+
+    console.log("CONFIRMAR PAGO:", {
+      product: config.id,
+      paymentId,
+      merchantOrderId,
+      preapprovalId,
+      user_id: req.body.user_id || "",
+      status: req.body.status || ""
+    });
+
+    if (paymentId) {
+      const { config: tokenConfig, resource } = await fetchMercadoPagoResource("payment", paymentId);
+
+      if (!resource) {
+        return res.status(404).json({ ok: false, error: "Pago no encontrado en Mercado Pago" });
+      }
+
+      const result = await activateApprovedPayment(resource, tokenConfig, paymentId);
+      return res.status(result.ok ? 200 : 400).json(result);
+    }
+
+    if (merchantOrderId) {
+      const { config: tokenConfig, resource, isPayment } = await fetchMercadoPagoResource("merchant_order", merchantOrderId);
+
+      if (!resource) {
+        return res.status(404).json({ ok: false, error: "Orden no encontrada en Mercado Pago" });
+      }
+
+      if (!isPayment) {
+        return res.status(400).json({
+          ok: false,
+          error: "La orden no tiene pago aprobado todavia",
+          status: resource.status || null
+        });
+      }
+
+      const result = await activateApprovedPayment(resource, tokenConfig, String(resource.id));
+      return res.status(result.ok ? 200 : 400).json(result);
+    }
+
+    if (preapprovalId) {
+      const { config: tokenConfig, resource } = await fetchMercadoPagoResource("preapproval", preapprovalId);
+
+      if (!resource) {
+        return res.status(404).json({ ok: false, error: "Suscripcion no encontrada en Mercado Pago" });
+      }
+
+      const result = await activateApprovedSubscription(resource, tokenConfig, preapprovalId);
+      return res.status(result.ok ? 200 : 400).json(result);
+    }
+
+    return res.status(400).json({
+      ok: false,
+      error: "Falta payment_id, collection_id, merchant_order_id o preapproval_id"
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Error confirmando pago" });
+  }
+});
 
 // =============================
 // REPROCESAR PAGO APROBADO
@@ -657,51 +780,8 @@ app.get("/reprocesar-pago/:payment_id", async (req, res) => {
       return res.status(404).json({ error: "Pago no encontrado en Mercado Pago" });
     }
 
-    if (resource.status !== "approved") {
-      return res.status(400).json({
-        error: "El pago aun no esta aprobado",
-        status: resource.status
-      });
-    }
-
-    const selectedPlan = planFromPayment(resource);
-
-    if (!selectedPlan) {
-      return res.status(400).json({
-        error: "No se pudo inferir el plan por metadata o monto",
-        amount: resource.transaction_amount,
-        metadata: resource.metadata || null
-      });
-    }
-
-    const { config, userId } = await resolvePaidUser(resource, tokenConfig);
-
-    if (!userId) {
-      return res.status(400).json({
-        error: "No se pudo resolver usuario del pago",
-        external_reference: resource.external_reference || null,
-        metadata: resource.metadata || null,
-        email: paymentEmail(resource) || null
-      });
-    }
-
-    await activateProduct(config, userId, {
-      plan: selectedPlan.id,
-      planLabel: selectedPlan.label,
-      paymentId: payment_id,
-      paymentStatus: resource.status,
-      premiumSince: new Date(),
-      premiumUntil: addPlanDuration(new Date(), selectedPlan),
-      autoRenew: false
-    });
-
-    res.json({
-      ok: true,
-      product: config.id,
-      user_id: userId,
-      plan: selectedPlan.id,
-      premiumUntil: addPlanDuration(new Date(), selectedPlan)
-    });
+    const result = await activateApprovedPayment(resource, tokenConfig, payment_id);
+    res.status(result.ok ? 200 : 400).json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error reprocesando pago" });
