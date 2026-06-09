@@ -102,6 +102,55 @@ function parseExternalReference(value, fallbackProductId = DEFAULT_PRODUCT_ID) {
   };
 }
 
+function paymentEmail(resource) {
+  return resource?.payer?.email ||
+    resource?.collector?.email ||
+    resource?.additional_info?.payer?.email ||
+    resource?.metadata?.email ||
+    "";
+}
+
+async function findUserByEmail(email, preferredConfig) {
+  if (!email) return null;
+  const configs = [
+    preferredConfig,
+    ...Object.values(PRODUCTS).filter((config) => config.id !== preferredConfig?.id)
+  ].filter(Boolean);
+
+  for (const config of configs) {
+    const snapshot = await db.collection(config.collection)
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) {
+      return {
+        config,
+        userId: snapshot.docs[0].id
+      };
+    }
+  }
+
+  return null;
+}
+
+async function resolvePaidUser(resource, tokenConfig) {
+  const metadataProductId = resource?.metadata?.product_id;
+  const metadataUserId = resource?.metadata?.user_id || resource?.metadata?.uid;
+  const parsedReference = parseExternalReference(resource?.external_reference, tokenConfig.id);
+  const config = productConfig(metadataProductId || parsedReference.productId || tokenConfig.id);
+  const userId = metadataUserId || parsedReference.userId;
+
+  if (userId) {
+    return { config, userId };
+  }
+
+  const userByEmail = await findUserByEmail(paymentEmail(resource), config);
+  if (userByEmail) return userByEmail;
+
+  return { config, userId: "" };
+}
+
 function tokenCandidates() {
   const seen = new Set();
   return Object.values(PRODUCTS).filter((config) => {
@@ -121,10 +170,14 @@ function appReturnUrl(config, status = "success") {
 }
 
 async function fetchMercadoPagoResource(topic, id) {
-  const isPayment = String(topic).includes("payment");
+  const rawTopic = String(topic || "").toLowerCase();
+  const isPayment = rawTopic.includes("payment");
+  const isMerchantOrder = rawTopic.includes("merchant_order");
   const resourceUrl = isPayment
     ? `https://api.mercadopago.com/v1/payments/${id}`
-    : `https://api.mercadopago.com/preapproval/${id}`;
+    : isMerchantOrder
+      ? `https://api.mercadopago.com/merchant_orders/${id}`
+      : `https://api.mercadopago.com/preapproval/${id}`;
 
   for (const config of tokenCandidates()) {
     const response = await fetch(resourceUrl, {
@@ -134,9 +187,38 @@ async function fetchMercadoPagoResource(topic, id) {
     });
 
     if (response.ok) {
+      const resource = await response.json();
+      if (isMerchantOrder) {
+        const approvedPayment = Array.isArray(resource.payments)
+          ? resource.payments.find((payment) => payment.status === "approved") || resource.payments[0]
+          : null;
+
+        if (!approvedPayment?.id) {
+          return {
+            config,
+            resource,
+            isPayment: false
+          };
+        }
+
+        const paymentResponse = await fetch(`https://api.mercadopago.com/v1/payments/${approvedPayment.id}`, {
+          headers: {
+            Authorization: `Bearer ${config.token}`
+          }
+        });
+
+        if (!paymentResponse.ok) continue;
+
+        return {
+          config,
+          resource: await paymentResponse.json(),
+          isPayment: true
+        };
+      }
+
       return {
         config,
-        resource: await response.json(),
+        resource,
         isPayment
       };
     }
@@ -288,7 +370,9 @@ app.post("/crear-suscripcion", async (req, res) => {
       external_reference: externalReference(config.id, user_id),
       metadata: {
         product_id: config.id,
-        product_name: config.name
+        product_name: config.name,
+        user_id,
+        email
       }
     };
 
@@ -386,6 +470,8 @@ app.post("/crear-pago", async (req, res) => {
       metadata: {
         product_id: config.id,
         product_name: config.name,
+        user_id,
+        email,
         plan: normalizedPlan
       }
     };
@@ -422,12 +508,14 @@ app.post("/crear-pago", async (req, res) => {
 // =============================
 // WEBHOOK MERCADOPAGO
 // =============================
-app.post("/webhook", async (req, res) => {
+async function handleMercadoPagoWebhook(req, res) {
   try {
-    console.log("WEBHOOK:", JSON.stringify(req.body, null, 2));
+    const body = req.body || {};
+    console.log("WEBHOOK:", JSON.stringify(body, null, 2));
+    console.log("WEBHOOK QUERY:", JSON.stringify(req.query, null, 2));
 
-    const id = req.body.data?.id || req.query["data.id"] || req.query.id;
-    const topic = req.body.type || req.query.type || req.body.topic || req.query.topic || "preapproval";
+    const id = body.data?.id || req.query["data.id"] || req.query.id;
+    const topic = body.type || req.query.type || body.topic || req.query.topic || "preapproval";
 
     if (!id) {
       console.log("Sin ID");
@@ -445,12 +533,18 @@ app.post("/webhook", async (req, res) => {
     console.log("TOPIC:", topic);
     console.log("RESOURCE STATUS:", resource.status);
 
-    const metadataProductId = resource.metadata?.product_id;
-    const parsedReference = parseExternalReference(resource.external_reference, tokenConfig.id);
-    const config = productConfig(metadataProductId || parsedReference.productId || tokenConfig.id);
-    const userId = parsedReference.userId;
+    const { config, userId } = await resolvePaidUser(resource, tokenConfig);
 
-    if (!userId) return res.sendStatus(200);
+    if (!userId) {
+      console.log("No se pudo resolver usuario del pago:", {
+        id,
+        topic,
+        external_reference: resource.external_reference,
+        metadata: resource.metadata || null,
+        email: paymentEmail(resource)
+      });
+      return res.sendStatus(200);
+    }
 
     if (isPayment) {
       if (resource.status !== "approved") {
@@ -506,6 +600,72 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.sendStatus(500);
+  }
+}
+
+app.post("/webhook", handleMercadoPagoWebhook);
+app.get("/webhook", handleMercadoPagoWebhook);
+
+// =============================
+// REPROCESAR PAGO APROBADO
+// =============================
+app.get("/reprocesar-pago/:payment_id", async (req, res) => {
+  try {
+    const { payment_id } = req.params;
+    const { config: tokenConfig, resource } = await fetchMercadoPagoResource("payment", payment_id);
+
+    if (!resource) {
+      return res.status(404).json({ error: "Pago no encontrado en Mercado Pago" });
+    }
+
+    if (resource.status !== "approved") {
+      return res.status(400).json({
+        error: "El pago aun no esta aprobado",
+        status: resource.status
+      });
+    }
+
+    const selectedPlan = planFromPayment(resource);
+
+    if (!selectedPlan) {
+      return res.status(400).json({
+        error: "No se pudo inferir el plan por metadata o monto",
+        amount: resource.transaction_amount,
+        metadata: resource.metadata || null
+      });
+    }
+
+    const { config, userId } = await resolvePaidUser(resource, tokenConfig);
+
+    if (!userId) {
+      return res.status(400).json({
+        error: "No se pudo resolver usuario del pago",
+        external_reference: resource.external_reference || null,
+        metadata: resource.metadata || null,
+        email: paymentEmail(resource) || null
+      });
+    }
+
+    await activateProduct(config, userId, {
+      plan: selectedPlan.id,
+      planLabel: selectedPlan.label,
+      paymentId: payment_id,
+      paymentStatus: resource.status,
+      premiumSince: new Date(),
+      premiumUntil: addPlanDuration(new Date(), selectedPlan),
+      autoRenew: false
+    });
+
+    res.json({
+      ok: true,
+      product: config.id,
+      user_id: userId,
+      plan: selectedPlan.id,
+      premiumUntil: addPlanDuration(new Date(), selectedPlan)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error reprocesando pago" });
   }
 });
 
