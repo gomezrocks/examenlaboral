@@ -6,7 +6,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const BASE_URL = process.env.BASE_URL; // ej: https://examenlaboral.onrender.com
+const BASE_URL = process.env.BASE_URL; // legado
+const BACKEND_PUBLIC_URL =
+  process.env.BACKEND_PUBLIC_URL ||
+  process.env.PAYMENT_RETURN_BASE_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  BASE_URL; // ej: https://examenlaboral.onrender.com
 const DEFAULT_PRODUCT_ID = "finesLaborales";
 
 const PRODUCTS = {
@@ -202,7 +207,7 @@ function tokenCandidates() {
 }
 
 function appReturnUrl(config, status = "success") {
-  const base = String(BASE_URL || config.returnUrl || "").replace(/\/$/, "");
+  const base = String(BACKEND_PUBLIC_URL || BASE_URL || config.returnUrl || "").replace(/\/$/, "");
   const query = new URLSearchParams({
     pago: status,
     producto: config.id
@@ -439,6 +444,7 @@ app.post("/crear-suscripcion", async (req, res) => {
     console.log("ORIGIN:", req.get("origin") || "");
     console.log("REFERER:", req.get("referer") || req.get("referrer") || "");
     console.log("BASE URL:", BASE_URL);
+    console.log("BACKEND URL:", BACKEND_PUBLIC_URL);
     console.log("TOKEN:", config.token ? `${config.token.substring(0, 15)}...` : "NO TOKEN");
     console.log("=================================");
 
@@ -464,7 +470,7 @@ app.post("/crear-suscripcion", async (req, res) => {
       },
       payer_email: email,
       back_url: appReturnUrl(config, "ok"),
-      notification_url: `${BASE_URL}/webhook`,
+      notification_url: `${BACKEND_PUBLIC_URL}/webhook`,
       external_reference: externalReference(config.id, user_id),
       metadata: {
         product_id: config.id,
@@ -525,6 +531,7 @@ app.post("/crear-pago", async (req, res) => {
     console.log("ORIGIN:", req.get("origin") || "");
     console.log("REFERER:", req.get("referer") || req.get("referrer") || "");
     console.log("BASE URL:", BASE_URL);
+    console.log("BACKEND URL:", BACKEND_PUBLIC_URL);
     console.log("=================================");
 
     if (!email || !user_id || !selectedPlan) {
@@ -566,7 +573,7 @@ app.post("/crear-pago", async (req, res) => {
         pending: appReturnUrl(config, "pendiente")
       },
       auto_return: "approved",
-      notification_url: `${BASE_URL}/webhook`,
+      notification_url: `${BACKEND_PUBLIC_URL}/webhook`,
       external_reference: externalReference(config.id, user_id),
       metadata: {
         product_id: config.id,
@@ -1037,7 +1044,11 @@ app.get("/config-productos", (req, res) => {
     }
   });
 
-  res.json({ products: data });
+  res.json({
+    backendPublicUrl: BACKEND_PUBLIC_URL,
+    baseUrl: BASE_URL,
+    products: data
+  });
 });
 
 async function premiumResponse(req, res, productId, userId) {
