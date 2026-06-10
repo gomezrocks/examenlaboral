@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { dbForProduct } from "./firebase.js";
+import { dbForProduct, firebaseProjectForProduct } from "./firebase.js";
 
 const app = express();
 app.use(cors());
@@ -80,6 +80,10 @@ function productConfig(productId = DEFAULT_PRODUCT_ID) {
 
 function dbForConfig(config) {
   return dbForProduct(config.id);
+}
+
+function firebaseProjectForConfig(config) {
+  return firebaseProjectForProduct(config.id);
 }
 
 function inferProductFromRequest(req) {
@@ -357,6 +361,7 @@ function paesMembership(data, premium) {
 }
 
 async function activateProduct(config, userId, data) {
+  const firebaseProject = firebaseProjectForConfig(config);
   const update = {
     products: {
       [config.id]: {
@@ -372,9 +377,17 @@ async function activateProduct(config, userId, data) {
   }
 
   await dbForConfig(config).collection(config.collection).doc(userId).set(update, { merge: true });
+  console.log("FIREBASE PREMIUM ACTIVADO:", {
+    product: config.id,
+    collection: config.collection,
+    userId,
+    firebaseProject,
+    plan: data.plan || null
+  });
 }
 
 async function deactivateProduct(config, userId, data = {}) {
+  const firebaseProject = firebaseProjectForConfig(config);
   const update = {
     products: {
       [config.id]: {
@@ -390,6 +403,13 @@ async function deactivateProduct(config, userId, data = {}) {
   }
 
   await dbForConfig(config).collection(config.collection).doc(userId).set(update, { merge: true });
+  console.log("FIREBASE PREMIUM DESACTIVADO:", {
+    product: config.id,
+    collection: config.collection,
+    userId,
+    firebaseProject,
+    plan: data.plan || null
+  });
 }
 
 // =============================
@@ -870,9 +890,35 @@ app.get("/", (req, res) => {
   res.send("Servidor OK");
 });
 
+app.get("/config-productos", (req, res) => {
+  const data = Object.values(PRODUCTS).map((config) => {
+    try {
+      return {
+        product: config.id,
+        collection: config.collection,
+        firebaseProject: firebaseProjectForConfig(config),
+        hasMercadoPagoToken: Boolean(config.token),
+        returnUrl: config.returnUrl
+      };
+    } catch (error) {
+      return {
+        product: config.id,
+        collection: config.collection,
+        firebaseProject: null,
+        firebaseError: error.message,
+        hasMercadoPagoToken: Boolean(config.token),
+        returnUrl: config.returnUrl
+      };
+    }
+  });
+
+  res.json({ products: data });
+});
+
 async function premiumResponse(req, res, productId, userId) {
   try {
     const config = productConfig(productId);
+    const firebaseProject = firebaseProjectForConfig(config);
 
     if (!userId) {
       return res.status(400).json({ error: "Falta user_id" });
@@ -892,6 +938,7 @@ async function premiumResponse(req, res, productId, userId) {
 
     res.json({
       product: config.id,
+      firebaseProject,
       premium,
       plan: product?.plan || "free",
       planLabel: product?.planLabel || null,
