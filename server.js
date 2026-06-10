@@ -88,7 +88,8 @@ function firebaseProjectForConfig(config) {
 
 function inferProductFromRequest(req) {
   const body = req.body || {};
-  const explicitProduct = body.product || body.product_id || body.productId;
+  const query = req.query || {};
+  const explicitProduct = body.product || body.product_id || body.productId || query.product || query.product_id || query.producto;
   if (explicitProduct) return explicitProduct;
 
   const origin = String(req.get("origin") || "");
@@ -201,10 +202,20 @@ function tokenCandidates() {
 }
 
 function appReturnUrl(config, status = "success") {
-  const base = String(config.returnUrl || BASE_URL || "").replace(/\/$/, "");
+  const base = String(BASE_URL || config.returnUrl || "").replace(/\/$/, "");
   const query = new URLSearchParams({
     pago: status,
     producto: config.id
+  });
+  return `${base}/retorno-pago?${query.toString()}`;
+}
+
+function finalAppReturnUrl(config, status = "ok", extra = {}) {
+  const base = String(config.returnUrl || BASE_URL || "").replace(/\/$/, "");
+  const query = new URLSearchParams({
+    pago: status,
+    producto: config.id,
+    ...Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== undefined && value !== null && value !== ""))
   });
   return `${base}/?${query.toString()}`;
 }
@@ -772,6 +783,120 @@ async function handleMercadoPagoWebhook(req, res) {
 
 app.post("/webhook", handleMercadoPagoWebhook);
 app.get("/webhook", handleMercadoPagoWebhook);
+
+async function confirmPaymentPayload(req, payload) {
+  const paymentId = payload.payment_id || payload.collection_id;
+  const merchantOrderId = payload.merchant_order_id;
+  const preferenceId = payload.preference_id;
+  const preapprovalId = payload.preapproval_id || payload.subscription_id;
+  const config = productFromRequest(req);
+  const parsedReference = parseExternalReference(payload.external_reference, config.id);
+  const userId = payload.user_id || parsedReference.userId;
+
+  console.log("CONFIRMAR PAGO:", {
+    product: config.id,
+    paymentId,
+    merchantOrderId,
+    preferenceId,
+    preapprovalId,
+    user_id: userId || "",
+    status: payload.status || payload.collection_status || ""
+  });
+
+  if (paymentId) {
+    const { config: tokenConfig, resource } = await fetchMercadoPagoResource("payment", paymentId);
+
+    if (!resource) {
+      return { ok: false, statusCode: 404, error: "Pago no encontrado en Mercado Pago" };
+    }
+
+    return {
+      statusCode: 200,
+      ...(await activateApprovedPayment(resource, tokenConfig, paymentId))
+    };
+  }
+
+  if (merchantOrderId) {
+    const { config: tokenConfig, resource, isPayment } = await fetchMercadoPagoResource("merchant_order", merchantOrderId);
+
+    if (!resource) {
+      return { ok: false, statusCode: 404, error: "Orden no encontrada en Mercado Pago" };
+    }
+
+    if (!isPayment) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: "La orden no tiene pago aprobado todavia",
+        status: resource.status || null
+      };
+    }
+
+    return {
+      statusCode: 200,
+      ...(await activateApprovedPayment(resource, tokenConfig, String(resource.id)))
+    };
+  }
+
+  if (preapprovalId) {
+    const { config: tokenConfig, resource } = await fetchMercadoPagoResource("preapproval", preapprovalId);
+
+    if (!resource) {
+      return { ok: false, statusCode: 404, error: "Suscripcion no encontrada en Mercado Pago" };
+    }
+
+    return {
+      statusCode: 200,
+      ...(await activateApprovedSubscription(resource, tokenConfig, preapprovalId))
+    };
+  }
+
+  if (preferenceId || userId || payload.external_reference) {
+    const reference = payload.external_reference || externalReference(config.id, userId);
+    const resource = await findApprovedPaymentByExternalReference(config, reference);
+
+    if (!resource) {
+      return {
+        ok: false,
+        statusCode: 404,
+        error: "No se encontro pago aprobado para este usuario",
+        preference_id: preferenceId || null,
+        external_reference: reference
+      };
+    }
+
+    return {
+      statusCode: 200,
+      ...(await activateApprovedPayment(resource, config, String(resource.id)))
+    };
+  }
+
+  return {
+    ok: false,
+    statusCode: 400,
+    error: "Falta payment_id, collection_id, merchant_order_id, preapproval_id, preference_id o user_id"
+  };
+}
+
+app.get("/retorno-pago", async (req, res) => {
+  const config = productFromRequest(req);
+  try {
+    const result = await confirmPaymentPayload(req, req.query || {});
+    console.log("RETORNO PAGO:", result);
+    const status = result.ok ? "ok" : "pendiente";
+    return res.redirect(finalAppReturnUrl(config, status, {
+      premium: result.ok ? "1" : "0",
+      motivo: result.code || result.error || "",
+      plan: result.plan || ""
+    }));
+  } catch (err) {
+    console.error("ERROR RETORNO PAGO:", err);
+    return res.redirect(finalAppReturnUrl(config, "error", {
+      premium: "0",
+      motivo: "error_confirmando_pago"
+    }));
+  }
+});
 
 // =============================
 // CONFIRMAR PAGO AL VOLVER A LA APP
