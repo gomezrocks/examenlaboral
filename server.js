@@ -388,6 +388,18 @@ async function activateProduct(config, userId, data) {
     }
   };
 
+  if (config.id === "finesLaborales") {
+    Object.assign(update, {
+      premium: true,
+      plan: data.plan || null,
+      planLabel: data.planLabel || null,
+      premiumSince: data.premiumSince || new Date(),
+      premiumUntil: data.premiumUntil || null,
+      autoRenew: Boolean(data.autoRenew),
+      paymentStatus: data.paymentStatus || data.subscriptionStatus || "approved"
+    });
+  }
+
   if (config.id === "paes") {
     update.membership = paesMembership(data, true);
   }
@@ -413,6 +425,10 @@ async function deactivateProduct(config, userId, data = {}) {
       }
     }
   };
+
+  if (config.id === "finesLaborales") {
+    update.premium = false;
+  }
 
   if (config.id === "paes") {
     update.membership = paesMembership(data, false);
