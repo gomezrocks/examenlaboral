@@ -24,6 +24,7 @@ const PRODUCTS = {
       process.env.FINES_LABORALES_APP_URL ||
       process.env.APP_URL_FINES ||
       BASE_URL,
+    nativeReturnUrl: process.env.FINES_ANDROID_RETURN_URL || "pruebalaboral://payment-return",
     token:
       process.env.MP_ACCESS_TOKEN_FINES ||
       process.env.MP_ACCESS_TOKEN_FINESLABORALES ||
@@ -37,6 +38,7 @@ const PRODUCTS = {
       process.env.PAES_APP_URL ||
       process.env.APP_URL_PAES ||
       "https://paes.apruebatodo.cl",
+    nativeReturnUrl: process.env.PAES_ANDROID_RETURN_URL || "paesestudio://payment-return",
     token: process.env.MP_ACCESS_TOKEN_PAES || process.env.MP_ACCESS_TOKEN
   }
 };
@@ -206,23 +208,29 @@ function tokenCandidates() {
   });
 }
 
-function appReturnUrl(config, status = "success") {
+function wantsNativeReturn(source = {}) {
+  const value = source.return_to_app || source.returnToApp || source.native_return;
+  return value === true || value === 1 || String(value).toLowerCase() === "true" || String(value) === "1";
+}
+
+function appReturnUrl(config, status = "success", returnToApp = false) {
   const base = String(BACKEND_PUBLIC_URL || BASE_URL || config.returnUrl || "").replace(/\/$/, "");
   const query = new URLSearchParams({
     pago: status,
-    producto: config.id
+    producto: config.id,
+    ...(returnToApp ? { return_to_app: "1" } : {})
   });
   return `${base}/retorno-pago?${query.toString()}`;
 }
 
-function finalAppReturnUrl(config, status = "ok", extra = {}) {
-  const base = String(config.returnUrl || BASE_URL || "").replace(/\/$/, "");
+function finalAppReturnUrl(config, status = "ok", extra = {}, returnToApp = false) {
+  const base = String(returnToApp ? config.nativeReturnUrl : (config.returnUrl || BASE_URL || "")).replace(/\/$/, "");
   const query = new URLSearchParams({
     pago: status,
     producto: config.id,
     ...Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== undefined && value !== null && value !== ""))
   });
-  return `${base}/?${query.toString()}`;
+  return `${base}${base.includes("?") ? "&" : "?"}${query.toString()}`;
 }
 
 async function fetchMercadoPagoResource(topic, id) {
@@ -451,6 +459,7 @@ app.post("/crear-suscripcion", async (req, res) => {
   try {
     const { email, user_id } = req.body;
     const config = productFromRequest(req);
+    const returnToApp = wantsNativeReturn(req.body || {});
 
     console.log("=================================");
     console.log("CREANDO SUSCRIPCION");
@@ -485,7 +494,7 @@ app.post("/crear-suscripcion", async (req, res) => {
         currency_id: "CLP"
       },
       payer_email: email,
-      back_url: appReturnUrl(config, "ok"),
+      back_url: appReturnUrl(config, "ok", returnToApp),
       notification_url: `${BACKEND_PUBLIC_URL}/webhook`,
       external_reference: externalReference(config.id, user_id),
       metadata: {
@@ -534,6 +543,7 @@ app.post("/crear-pago", async (req, res) => {
   try {
     const { email, user_id, plan } = req.body;
     const config = productFromRequest(req);
+    const returnToApp = wantsNativeReturn(req.body || {});
     const normalizedPlan = normalizePlanId(plan);
     const selectedPlan = ONE_TIME_PLANS[normalizedPlan];
 
@@ -584,9 +594,9 @@ app.post("/crear-pago", async (req, res) => {
         email
       },
       back_urls: {
-        success: appReturnUrl(config, "ok"),
-        failure: appReturnUrl(config, "error"),
-        pending: appReturnUrl(config, "pendiente")
+        success: appReturnUrl(config, "ok", returnToApp),
+        failure: appReturnUrl(config, "error", returnToApp),
+        pending: appReturnUrl(config, "pendiente", returnToApp)
       },
       auto_return: "approved",
       notification_url: `${BACKEND_PUBLIC_URL}/webhook`,
@@ -903,6 +913,7 @@ async function confirmPaymentPayload(req, payload) {
 
 app.get("/retorno-pago", async (req, res) => {
   const config = productFromRequest(req);
+  const returnToApp = wantsNativeReturn(req.query || {});
   try {
     const result = await confirmPaymentPayload(req, req.query || {});
     console.log("RETORNO PAGO:", result);
@@ -911,13 +922,13 @@ app.get("/retorno-pago", async (req, res) => {
       premium: result.ok ? "1" : "0",
       motivo: result.code || result.error || "",
       plan: result.plan || ""
-    }));
+    }, returnToApp));
   } catch (err) {
     console.error("ERROR RETORNO PAGO:", err);
     return res.redirect(finalAppReturnUrl(config, "error", {
       premium: "0",
       motivo: "error_confirmando_pago"
-    }));
+    }, returnToApp));
   }
 });
 
