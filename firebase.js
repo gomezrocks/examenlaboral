@@ -47,7 +47,7 @@ function firebaseApp(name, envName, fallbackEnvName = null) {
 
 export function dbForProduct(productId = "finesLaborales") {
   if (String(productId).startsWith("examenesLibres")) {
-    return getFirestore(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]));
+    return getFirestore(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]));
   }
   if (productId === "paes") {
     return getFirestore(firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]));
@@ -58,7 +58,7 @@ export function dbForProduct(productId = "finesLaborales") {
 
 export function firebaseProjectForProduct(productId = "finesLaborales") {
   if (String(productId).startsWith("examenesLibres")) {
-    firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]);
+    firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]);
     return projectIds.examenesLibres;
   }
   if (productId === "paes") {
@@ -72,7 +72,7 @@ export function firebaseProjectForProduct(productId = "finesLaborales") {
 
 export function authForProduct(productId = "finesLaborales") {
   if (String(productId).startsWith("examenesLibres")) {
-    return getAuth(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]));
+    return getAuth(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]));
   }
   if (productId === "paes") {
     return getAuth(firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]));
