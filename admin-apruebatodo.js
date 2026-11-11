@@ -1,5 +1,5 @@
 // Administración privada de ApruebaTodo. Solo UID explícitamente autorizado.
-import { dbForProduct, authForProduct } from './firebase.js';
+import { dbForProduct, authForProduct, firebaseProjectForProduct } from './firebase.js';
 
 const API = 'https://api.mercadopago.com';
 const PRODUCTS = [
@@ -15,6 +15,38 @@ const iso = value => {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 };
 const bearerToken = request => /^Bearer (.+)$/.exec(request.headers.authorization || '')?.[1];
+
+// Lectura paginada: los 200 primeros usuarios daban cifras falsas y dejaban
+// fuera precisamente las cuentas de prueba recién creadas.
+async function readCollection(db, name, max = 10000) {
+  const docs = [];
+  let cursor = null;
+  while (docs.length < max) {
+    const pageSize = Math.min(500, max - docs.length);
+    let query = db.collection(name).orderBy('__name__').limit(pageSize);
+    if (cursor) query = query.startAfter(cursor);
+    const snapshot = await query.get();
+    docs.push(...snapshot.docs);
+    if (snapshot.empty || snapshot.size < pageSize) break;
+    cursor = snapshot.docs[snapshot.docs.length - 1];
+  }
+  return { docs, truncated: docs.length === max };
+}
+
+async function attachAuthEmails(rows, product) {
+  const auth = authForProduct(product.source);
+  const missing = rows.filter(row => !row.email);
+  for (let offset = 0; offset < missing.length; offset += 100) {
+    const batch = missing.slice(offset, offset + 100);
+    try {
+      const found = await auth.getUsers(batch.map(row => ({ uid: row.uid })));
+      const emails = new Map(found.users.map(user => [user.uid, user.email || null]));
+      for (const row of batch) row.email = emails.get(row.uid) || null;
+    } catch (error) {
+      console.warn('Admin ApruebaTodo: no se pudieron completar algunos correos', product.id, error.message);
+    }
+  }
+}
 
 async function requireAdmin(req, res, next) {
   try {
@@ -54,21 +86,26 @@ export function registerApruebaTodoAdmin(app) {
     const products = [];
     for (const product of PRODUCTS) {
       try {
+        if (product.id === 'finesLaborales' &&
+            firebaseProjectForProduct(product.source) === firebaseProjectForProduct('examenesLibres1Basico')) {
+          products.push({ id: product.id, label: product.label,
+            error: 'Fines Laborales está usando el Firebase de Exámenes Libres. Configura FIREBASE_SERVICE_ACCOUNT_FINES para mostrar cifras reales.' });
+          continue;
+        }
         const db = dbForProduct(product.source);
-        // Límite intencional para una primera versión; nunca presentar el total
-        // de la muestra como el total histórico si hay más documentos.
-        const users = await db.collection(product.collection).limit(200).get();
+        const users = await readCollection(db, product.collection);
         const normalized = users.docs.map(doc => normalizeUser(doc, product));
+        await attachAuthEmails(normalized, product);
         const row = {
           id: product.id, label: product.label, users: normalized,
-          sampled: normalized.length, truncated: normalized.length === 200,
+          sampled: normalized.length, truncated: users.truncated,
           premiumInSample: normalized.filter(u => u.premium).length
         };
         if (product.id === 'examenesLibres1Basico') {
           const [subscriptions, orders, invoices] = await Promise.all([
-            db.collection('examenes_libres_subscriptions').limit(200).get(),
-            db.collection('examenes_libres_orders').limit(200).get(),
-            db.collection('examenes_libres_paid_invoices').limit(200).get()
+            readCollection(db, 'examenes_libres_subscriptions'),
+            readCollection(db, 'examenes_libres_orders'),
+            readCollection(db, 'examenes_libres_paid_invoices')
           ]);
           const byUid = new Map(normalized.map(u => [u.uid, u]));
           const invoiceCounts = new Map();
@@ -82,6 +119,7 @@ export function registerApruebaTodoAdmin(app) {
               reference: doc.id, uid: s.uid, email: byUid.get(s.uid)?.email || null,
               status: s.status || 'unknown', subscriptionId: s.subscriptionId || null,
               paidInvoicesInSample: invoiceCounts.get(s.subscriptionId) || 0,
+              paymentState: invoiceCounts.get(s.subscriptionId) ? 'Con pago acreditado' : 'Sin factura acreditada',
               createdAt: iso(s.createdAt),
               premiumUntil: byUid.get(s.uid)?.premiumUntil || null
             };
@@ -91,9 +129,9 @@ export function registerApruebaTodoAdmin(app) {
             return { reference: doc.id, email: byUid.get(o.uid)?.email || null,
               status: o.status || 'unknown', amount: o.amount || null, createdAt: iso(o.createdAt) };
           });
-          row.subscriptionsTruncated = subscriptions.size === 200;
-          row.ordersTruncated = orders.size === 200;
-          row.invoicesTruncated = invoices.size === 200;
+          row.subscriptionsTruncated = subscriptions.truncated;
+          row.ordersTruncated = orders.truncated;
+          row.invoicesTruncated = invoices.truncated;
         }
         products.push(row);
       } catch (error) {
