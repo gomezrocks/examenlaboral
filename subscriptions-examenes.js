@@ -123,16 +123,23 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       if (!bearer) return res.sendStatus(401);
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
-      if (!product || !user.email) return res.status(400).json({ error: 'Datos inválidos' });
+      if (!product || !user.uid) return res.status(400).json({ error: 'Datos inválidos' });
+      // El comprador de Mercado Pago puede ser distinto del alumno autenticado.
+      // El UID verificado del alumno y la referencia aleatoria siguen siendo
+      // la única asociación que puede habilitar Premium en Firebase.
+      const payerEmail = String(req.body?.payer_email || '').trim().toLowerCase();
+      if (payerEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
+        return res.status(400).json({ error: 'Ingresa un correo válido de quien realizará el pago' });
+      }
       const ref = randomUUID();
       await db.collection('examenes_libres_subscriptions').doc(ref).create({
-        uid: user.uid, product: product.id, status: 'created',
+        uid: user.uid, product: product.id, payerEmail, status: 'created',
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       const sub = await mp('/preapproval', { method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: product.reason + ' — Mensual',
-          external_reference: ref, payer_email: user.email,
+          external_reference: ref, payer_email: payerEmail,
           back_url: product.backUrl,
           auto_recurring: { frequency: 1, frequency_type: 'months',
             transaction_amount: MONTHLY_AMOUNT, currency_id: 'CLP' } }) });
