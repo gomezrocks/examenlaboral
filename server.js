@@ -4,10 +4,12 @@ import { dbForProduct, firebaseProjectForProduct, authForProduct } from "./fireb
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { registerExamenesLibresOrders } from "./orders-examenes.js";
 import { registerExamenesLibresSubscriptions } from "./subscriptions-examenes.js";
+import { registerApruebaTodoAdmin } from "./admin-apruebatodo.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+registerApruebaTodoAdmin(app);
 
 // Integración aislada: las rutas anteriores de PAES/Fines Laborales permanecen iguales.
 // Firebase Admin de Exámenes Libres se inicializa de forma diferida al primer uso.

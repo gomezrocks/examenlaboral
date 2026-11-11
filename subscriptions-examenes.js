@@ -34,7 +34,9 @@ export function registerExamenesLibresSubscriptions(app, admin) {
         invoice.payment?.status !== 'approved' || invoice.payment?.status_detail !== 'accredited' ||
         Number(invoice.transaction_amount) !== MONTHLY_AMOUNT || invoice.currency_id !== 'CLP') return false;
     const sub = await mp(`/preapproval/${encodeURIComponent(invoice.preapproval_id)}`);
-    if (sub.id !== invoice.preapproval_id || sub.status !== 'authorized' ||
+    // Una factura aprobada antes de cancelar también debe acreditarse aunque
+    // la notificación llegue después de que la suscripción pase a "canceled".
+    if (sub.id !== invoice.preapproval_id || !['authorized', 'canceled'].includes(sub.status) ||
         !sub.external_reference) return false;
     const subscriptionRef = db.collection('examenes_libres_subscriptions').doc(String(sub.external_reference));
     const saved = await subscriptionRef.get();
