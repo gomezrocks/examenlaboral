@@ -185,10 +185,10 @@ export function registerApruebaTodoAdmin(app) {
       if (!check.ok) throw new Error(`Consulta MP ${check.status}`);
       const sub = await check.json();
       if (sub.id !== record.subscriptionId || sub.external_reference !== reference) return res.sendStatus(409);
-      if (sub.status !== 'canceled') {
+      if (!['cancelled', 'canceled'].includes(sub.status)) {
         const cancel = await fetch(`${API}/preapproval/${id}`, {
           method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'canceled' })
+          body: JSON.stringify({ status: 'cancelled' })
         });
         if (!cancel.ok) {
           const body = await cancel.json().catch(() => ({}));
@@ -204,10 +204,10 @@ export function registerApruebaTodoAdmin(app) {
         }
       }
       // NO borrar premium ni premiumUntil: el alumno conserva lo ya pagado.
-      await ref.set({ status: 'canceled', canceledAt: new Date(), canceledBy: req.adminUid }, { merge: true });
+      await ref.set({ status: 'cancelled', canceledAt: new Date(), canceledBy: req.adminUid }, { merge: true });
       await db.collection('examenes_libres_admin_audit').add({ action: 'cancel_subscription',
         reference, subscriptionId: record.subscriptionId, adminUid: req.adminUid, at: new Date() });
-      return res.json({ ok: true, status: 'canceled', paidAccessPreserved: true });
+      return res.json({ ok: true, status: 'cancelled', paidAccessPreserved: true });
     } catch (error) {
       console.error('Admin ApruebaTodo cancelar', error.message);
       return res.status(502).json({ error: 'Mercado Pago no confirmó la cancelación. Revisa los logs.' });
