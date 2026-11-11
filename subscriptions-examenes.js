@@ -78,11 +78,26 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       const id = String(req.body?.preapproval_id || '');
       if (!/^[a-zA-Z0-9-]{12,100}$/.test(id)) return res.status(400).json({ error: 'Suscripción inválida' });
       const sub = await mp(`/preapproval/${encodeURIComponent(id)}`);
-      if (sub.id !== id || !sub.external_reference) return res.sendStatus(404);
+      if (sub.id !== id || !sub.external_reference) {
+        console.warn('MP_EXAMENES_ASOCIACION', { reason: 'mp_reference_missing' });
+        return res.status(404).json({ error: 'No se encontró la referencia del pago' });
+      }
       const saved = await db.collection('examenes_libres_subscriptions').doc(String(sub.external_reference)).get();
-      if (!saved.exists || saved.data().uid !== user.uid || saved.data().subscriptionId !== id ||
-          saved.data().product !== 'examenesLibres1Basico' ||
-          sub.payer_email?.toLowerCase() !== user.email?.toLowerCase()) return res.sendStatus(403);
+      if (!saved.exists) {
+        console.warn('MP_EXAMENES_ASOCIACION', { reason: 'reference_not_in_firestore' });
+        return res.status(404).json({ error: 'No encontramos la suscripción en Firebase' });
+      }
+      // La cuenta MP del pagador puede ser distinta del correo usado para entrar
+      // a ApruebaTodo, especialmente con usuarios de prueba. El vínculo seguro
+      // es la referencia aleatoria creada por Render y su UID verificado.
+      if (saved.data().uid !== user.uid || saved.data().subscriptionId !== id ||
+          saved.data().product !== 'examenesLibres1Basico') {
+        console.warn('MP_EXAMENES_ASOCIACION', {
+          reason: saved.data().uid !== user.uid ? 'firebase_uid_mismatch' :
+            saved.data().subscriptionId !== id ? 'subscription_id_mismatch' : 'product_mismatch'
+        });
+        return res.status(403).json({ error: 'La suscripción no corresponde a esta cuenta' });
+      }
       // Una firma de suscripción no equivale a un cobro: exigimos factura acreditada.
       const invoices = await mp(`/authorized_payments/search?preapproval_id=${encodeURIComponent(id)}&limit=30`);
       let credited = false;
@@ -135,11 +150,15 @@ export function registerExamenesLibresSubscriptions(app, admin) {
     const id = req.query['data.id'] || req.body?.data?.id;
     if (!validWebhookSignature({ signature: req.headers['x-signature'],
       requestId: req.headers['x-request-id'], dataId: id,
-      secret: process.env.MP_EXAMENES_WEBHOOK_SECRET })) return res.sendStatus(401);
+      secret: process.env.MP_EXAMENES_WEBHOOK_SECRET })) {
+      console.warn('MP_EXAMENES_WEBHOOK', { reason: 'invalid_signature', type: req.body?.type });
+      return res.sendStatus(401);
+    }
     if (req.body?.type !== 'subscription_authorized_payment') return res.sendStatus(200);
     try {
       const invoice = await mp(`/authorized_payments/${encodeURIComponent(id)}`);
-      await creditAuthorizedPayment(invoice);
+      const credited = await creditAuthorizedPayment(invoice);
+      console.info('MP_EXAMENES_WEBHOOK', { type: req.body.type, credited });
       return res.sendStatus(200);
     } catch (err) {
       console.error('Webhook factura recurrente', err);
