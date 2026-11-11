@@ -82,6 +82,29 @@ function normalizeUser(doc, product) {
 }
 
 export function registerApruebaTodoAdmin(app) {
+  app.get('/admin-apruebatodo/subscription-state', requireAdmin, async (req, res) => {
+    try {
+      const reference = String(req.query.reference || '');
+      if (!/^[\da-f-]{36}$/i.test(reference)) return res.status(400).json({ error: 'Referencia inválida' });
+      const db = dbForProduct('examenesLibres1Basico');
+      const snapshot = await db.collection('examenes_libres_subscriptions').doc(reference).get();
+      if (!snapshot.exists || !snapshot.data().subscriptionId) return res.sendStatus(404);
+      const token = process.env.MP_EXAMENES_ACCESS_TOKEN;
+      if (!token) return res.status(503).json({ error: 'Falta token de Mercado Pago' });
+      const response = await fetch(`${API}/preapproval/${encodeURIComponent(snapshot.data().subscriptionId)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) return res.status(502).json({ error: `Mercado Pago respondió ${response.status}` });
+      const sub = await response.json();
+      if (sub.id !== snapshot.data().subscriptionId || sub.external_reference !== reference) return res.sendStatus(409);
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({ status: sub.status, nextPaymentDate: sub.next_payment_date || null,
+        recordedStatus: snapshot.data().status || 'unknown' });
+    } catch (error) {
+      console.error('Admin ApruebaTodo consultar estado', error.message);
+      return res.status(502).json({ error: 'No fue posible consultar Mercado Pago' });
+    }
+  });
   app.get('/admin-apruebatodo/summary', requireAdmin, async (_req, res) => {
     const products = [];
     for (const product of PRODUCTS) {
@@ -167,7 +190,18 @@ export function registerApruebaTodoAdmin(app) {
           method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: 'canceled' })
         });
-        if (!cancel.ok) throw new Error(`Cancelación MP ${cancel.status}`);
+        if (!cancel.ok) {
+          const body = await cancel.json().catch(() => ({}));
+          console.warn('MP_EXAMENES_CANCELACION_RECHAZADA', {
+            httpStatus: cancel.status,
+            mpError: String(body.error || '').slice(0, 120),
+            message: String(body.message || '').slice(0, 220),
+            causes: Array.isArray(body.cause) ? body.cause.slice(0, 3).map(c => ({
+              code: c.code, description: String(c.description || '').slice(0, 180)
+            })) : undefined
+          });
+          return res.status(409).json({ error: 'Mercado Pago rechazó la cancelación. Consulta el motivo en los logs.' });
+        }
       }
       // NO borrar premium ni premiumUntil: el alumno conserva lo ya pagado.
       await ref.set({ status: 'canceled', canceledAt: new Date(), canceledBy: req.adminUid }, { merge: true });
