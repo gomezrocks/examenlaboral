@@ -2,7 +2,6 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { getProduct } from './productos-examenes.js';
 
 const MP_API = 'https://api.mercadopago.com/v1/orders';
-const APP_ID = '4130965569241909';
 const readToken = () => {
   const token = process.env.MP_EXAMENES_ACCESS_TOKEN;
   if (!token) throw new Error('Falta MP_EXAMENES_ACCESS_TOKEN');
@@ -87,10 +86,21 @@ export function registerExamenesLibresOrders(app, admin) {
       if (!pending.exists) return res.sendStatus(200);
       const record = pending.data();
       const product = getProduct(record.product);
+      // Orders puede devolver la moneda como currency_id. La notificación
+      // firmada incluye ese campo aun cuando GET omita la propiedad.
+      const currency = order.currency_id || order.currency || req.body?.data?.currency_id;
+      const expectedApplication = process.env.MP_EXAMENES_APP_ID;
+      const notificationApplication = String(req.body?.application_id ?? '');
       if (!product || order.external_reference !== pending.id ||
           (record.mpOrderId && record.mpOrderId !== order.id) ||
-          String(order.integration_data?.application_id) !== APP_ID ||
-          order.currency !== 'CLP' || Number(order.total_amount) !== product.amount) {
+          (expectedApplication && notificationApplication !== String(expectedApplication)) ||
+          currency !== 'CLP' || Number(order.total_amount) !== product.amount) {
+        console.warn('MP_EXAMENES_ORDER_RECHAZADA', {
+          productKnown: Boolean(product), referenceMatches: order.external_reference === pending.id,
+          orderIdMatches: !record.mpOrderId || record.mpOrderId === order.id,
+          applicationMatches: !expectedApplication || notificationApplication === String(expectedApplication),
+          currency, amountMatches: Boolean(product && Number(order.total_amount) === product.amount)
+        });
         return res.status(409).json({ error: 'Order no coincide con el producto' });
       }
       if (order.status !== 'processed' || order.status_detail !== 'accredited' ||
@@ -106,6 +116,7 @@ export function registerExamenesLibresOrders(app, admin) {
         tx.set(ref, { status: 'accredited', mpOrderId: order.id,
           creditedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       });
+      console.info('MP_EXAMENES_ORDER_ACREDITADA', { product: product.id });
       return res.sendStatus(200);
     } catch (err) {
       console.error('Webhook Orders Exámenes Libres', err);
