@@ -10,7 +10,19 @@ async function mp(path, options = {}) {
     Authorization: `Bearer ${process.env.MP_EXAMENES_ACCESS_TOKEN}`, ...(options.headers || {})
   } });
   const data = await r.json();
-  if (!r.ok) throw new Error(`Mercado Pago HTTP ${r.status}`);
+  if (!r.ok) {
+    // Registrar solo datos diagnósticos; nunca tokens ni el cuerpo completo.
+    const detail = {
+      status: r.status,
+      error: String(data?.error ?? '').slice(0, 160),
+      message: String(data?.message ?? '').slice(0, 300),
+      cause: Array.isArray(data?.cause)
+        ? data.cause.slice(0, 4).map(c => ({ code: c.code, description: String(c.description ?? '').slice(0, 200) }))
+        : undefined
+    };
+    console.error('MP_EXAMENES_SUSCRIPCION_RECHAZADA', detail);
+    throw new Error(`Mercado Pago HTTP ${r.status}`);
+  }
   return data;
 }
 
