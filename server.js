@@ -1,10 +1,29 @@
 import express from "express";
 import cors from "cors";
-import { dbForProduct, firebaseProjectForProduct } from "./firebase.js";
+import { dbForProduct, firebaseProjectForProduct, authForProduct } from "./firebase.js";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { registerExamenesLibresOrders } from "./orders-examenes.js";
+import { registerExamenesLibresSubscriptions } from "./subscriptions-examenes.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Integración aislada: las rutas anteriores de PAES/Fines Laborales permanecen iguales.
+// Firebase Admin de Exámenes Libres se inicializa de forma diferida al primer uso.
+const examAdmin = {
+  firestore: Object.assign(() => dbForProduct("examenesLibres1Basico"), { FieldValue, Timestamp }),
+  auth: () => authForProduct("examenesLibres1Basico")
+};
+const examOrdersWebhook = registerExamenesLibresOrders(app, examAdmin);
+const examSubscriptionsWebhook = registerExamenesLibresSubscriptions(app, examAdmin);
+// Un único destino HTTPS de webhooks en Mercado Pago para ambas modalidades.
+app.post("/webhook-examenes-libres", (req, res) => {
+  const type = req.body?.type;
+  if (type === "order") return examOrdersWebhook(req, res);
+  if (type === "subscription_authorized_payment") return examSubscriptionsWebhook(req, res);
+  return res.sendStatus(200);
+});
 
 const BASE_URL = process.env.BASE_URL; // legado
 const BACKEND_PUBLIC_URL =

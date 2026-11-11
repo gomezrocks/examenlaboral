@@ -1,5 +1,6 @@
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
 
 const projectIds = {};
 
@@ -45,6 +46,9 @@ function firebaseApp(name, envName, fallbackEnvName = null) {
 }
 
 export function dbForProduct(productId = "finesLaborales") {
+  if (String(productId).startsWith("examenesLibres")) {
+    return getFirestore(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]));
+  }
   if (productId === "paes") {
     return getFirestore(firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]));
   }
@@ -53,6 +57,10 @@ export function dbForProduct(productId = "finesLaborales") {
 }
 
 export function firebaseProjectForProduct(productId = "finesLaborales") {
+  if (String(productId).startsWith("examenesLibres")) {
+    firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]);
+    return projectIds.examenesLibres;
+  }
   if (productId === "paes") {
     firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]);
     return projectIds.paes;
@@ -60,4 +68,14 @@ export function firebaseProjectForProduct(productId = "finesLaborales") {
 
   firebaseApp("finesLaborales", ["FIREBASE_SERVICE_ACCOUNT_FINES", "FINES_FIREBASE_SERVICE_ACCOUNT"], "FIREBASE_SERVICE_ACCOUNT");
   return projectIds.finesLaborales;
+}
+
+export function authForProduct(productId = "finesLaborales") {
+  if (String(productId).startsWith("examenesLibres")) {
+    return getAuth(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT"]));
+  }
+  if (productId === "paes") {
+    return getAuth(firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]));
+  }
+  return getAuth(firebaseApp("finesLaborales", ["FIREBASE_SERVICE_ACCOUNT_FINES", "FINES_FIREBASE_SERVICE_ACCOUNT"], "FIREBASE_SERVICE_ACCOUNT"));
 }
