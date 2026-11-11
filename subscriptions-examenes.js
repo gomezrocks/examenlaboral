@@ -28,6 +28,78 @@ async function mp(path, options = {}) {
 
 export function registerExamenesLibresSubscriptions(app, admin) {
   const db = admin.firestore();
+  // Fuente única de acreditación para webhook y regreso del comprador.
+  async function creditAuthorizedPayment(invoice, expectedUid = null) {
+    if (!invoice?.id || !invoice?.preapproval_id ||
+        invoice.payment?.status !== 'approved' || invoice.payment?.status_detail !== 'accredited' ||
+        Number(invoice.transaction_amount) !== MONTHLY_AMOUNT || invoice.currency_id !== 'CLP') return false;
+    const sub = await mp(`/preapproval/${encodeURIComponent(invoice.preapproval_id)}`);
+    if (sub.id !== invoice.preapproval_id || sub.status !== 'authorized' ||
+        !sub.external_reference) return false;
+    const subscriptionRef = db.collection('examenes_libres_subscriptions').doc(String(sub.external_reference));
+    const saved = await subscriptionRef.get();
+    if (!saved.exists || saved.data().subscriptionId !== sub.id ||
+        (expectedUid && saved.data().uid !== expectedUid)) return false;
+    const record = saved.data();
+    if (record.product !== 'examenesLibres1Basico') return false;
+    const paidRef = db.collection('examenes_libres_paid_invoices').doc(String(invoice.id));
+    await db.runTransaction(async tx => {
+      const prior = await tx.get(paidRef);
+      if (prior.exists) return;
+      const userRef = db.collection('users').doc(record.uid);
+      const user = await tx.get(userRef);
+      const product = user.data()?.products?.[record.product];
+      // Un acceso de pago único no puede convertirse en acceso temporal.
+      if (product?.premium === true && product?.premiumUntil === null) {
+        tx.create(paidRef, { uid: record.uid, product: record.product,
+          subscriptionId: sub.id, paidAt: admin.firestore.FieldValue.serverTimestamp() });
+        return;
+      }
+      const existing = product?.premiumUntil;
+      const existingMs = existing?.toMillis?.() || (existing ? new Date(existing).getTime() : 0);
+      const until = new Date(Math.max(Date.now(), existingMs || 0));
+      until.setUTCMonth(until.getUTCMonth() + 1);
+      tx.set(userRef, { products: { [record.product]: {
+        premium: true, premiumUntil: admin.firestore.Timestamp.fromDate(until),
+        premiumSince: admin.firestore.FieldValue.serverTimestamp(), subscriptionId: sub.id
+      } } }, { merge: true });
+      tx.create(paidRef, { uid: record.uid, product: record.product,
+        subscriptionId: sub.id, paidAt: admin.firestore.FieldValue.serverTimestamp() });
+    });
+    return true;
+  }
+
+  // El navegador solo aporta el ID: el servidor verifica usuario, suscripción y factura en MP.
+  app.post('/confirmar-suscripcion-examenes-libres', async (req, res) => {
+    try {
+      const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+      if (!bearer) return res.sendStatus(401);
+      const user = await admin.auth().verifyIdToken(bearer[1], true);
+      const id = String(req.body?.preapproval_id || '');
+      if (!/^[a-zA-Z0-9-]{12,100}$/.test(id)) return res.status(400).json({ error: 'Suscripción inválida' });
+      const sub = await mp(`/preapproval/${encodeURIComponent(id)}`);
+      if (sub.id !== id || !sub.external_reference) return res.sendStatus(404);
+      const saved = await db.collection('examenes_libres_subscriptions').doc(String(sub.external_reference)).get();
+      if (!saved.exists || saved.data().uid !== user.uid || saved.data().subscriptionId !== id ||
+          saved.data().product !== 'examenesLibres1Basico' ||
+          sub.payer_email?.toLowerCase() !== user.email?.toLowerCase()) return res.sendStatus(403);
+      // Una firma de suscripción no equivale a un cobro: exigimos factura acreditada.
+      const invoices = await mp(`/authorized_payments/search?preapproval_id=${encodeURIComponent(id)}&limit=30`);
+      let credited = false;
+      for (const invoice of (invoices.results || [])) {
+        if (await creditAuthorizedPayment(invoice, user.uid)) credited = true;
+      }
+      const userDoc = await db.collection('users').doc(user.uid).get();
+      const active = userDoc.data()?.products?.examenesLibres1Basico;
+      const until = active?.premiumUntil?.toMillis?.() ?? 0;
+      const premium = active?.premium === true && (active?.premiumUntil === null || until > Date.now());
+      console.info('MP_EXAMENES_RECONCILIACION', { credited, premium, invoiceCount: (invoices.results || []).length });
+      return res.json({ premium, status: premium ? 'active' : 'pending' });
+    } catch (err) {
+      console.error('Confirmar suscripción Exámenes Libres', err);
+      return res.status(502).json({ error: 'No se pudo verificar el pago todavía' });
+    }
+  });
   app.post('/crear-suscripcion-examenes-libres', async (req, res) => {
     try {
       const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '');
@@ -67,32 +139,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
     if (req.body?.type !== 'subscription_authorized_payment') return res.sendStatus(200);
     try {
       const invoice = await mp(`/authorized_payments/${encodeURIComponent(id)}`);
-      if (invoice.payment?.status !== 'approved' || invoice.payment?.status_detail !== 'accredited') return res.sendStatus(200);
-      if (Number(invoice.transaction_amount) !== MONTHLY_AMOUNT || invoice.currency_id !== 'CLP') return res.sendStatus(409);
-      const sub = await mp(`/preapproval/${encodeURIComponent(invoice.preapproval_id)}`);
-      const ref = db.collection('examenes_libres_subscriptions').doc(String(sub.external_reference));
-      const saved = await ref.get();
-      if (!saved.exists || saved.data().subscriptionId !== sub.id ||
-          sub.status !== 'authorized') return res.sendStatus(200);
-      const record = saved.data();
-      const paidRef = db.collection('examenes_libres_paid_invoices').doc(String(id));
-      await db.runTransaction(async tx => {
-        const prior = await tx.get(paidRef);
-        if (prior.exists) return;
-        const userRef = db.collection('users').doc(record.uid);
-        const user = await tx.get(userRef);
-        const existing = user.data()?.products?.[record.product]?.premiumUntil;
-        const existingMs = existing?.toMillis?.() || (existing ? new Date(existing).getTime() : 0);
-        const base = Math.max(Date.now(), existingMs || 0);
-        const until = new Date(base);
-        until.setUTCMonth(until.getUTCMonth() + 1);
-        tx.set(userRef, { products: { [record.product]: {
-          premium: true, premiumUntil: admin.firestore.Timestamp.fromDate(until),
-          premiumSince: admin.firestore.FieldValue.serverTimestamp(), subscriptionId: sub.id
-        } } }, { merge: true });
-        tx.create(paidRef, { uid: record.uid, product: record.product,
-          subscriptionId: sub.id, paidAt: admin.firestore.FieldValue.serverTimestamp() });
-      });
+      await creditAuthorizedPayment(invoice);
       return res.sendStatus(200);
     } catch (err) {
       console.error('Webhook factura recurrente', err);
