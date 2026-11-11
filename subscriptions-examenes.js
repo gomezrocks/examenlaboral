@@ -99,7 +99,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
         return res.status(403).json({ error: 'La suscripción no corresponde a esta cuenta' });
       }
       // Una firma de suscripción no equivale a un cobro: exigimos factura acreditada.
-      const invoices = await mp(`/authorized_payments/search?preapproval_id=${encodeURIComponent(id)}&limit=30`);
+      const invoices = await mp(`/authorized_payments/search?preapproval_id=${encodeURIComponent(id)}`);
       let credited = false;
       for (const invoice of (invoices.results || [])) {
         if (await creditAuthorizedPayment(invoice, user.uid)) credited = true;
