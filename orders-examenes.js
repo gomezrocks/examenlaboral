@@ -41,6 +41,10 @@ export function registerExamenesLibresOrders(app, admin) {
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
       if (!product) return res.status(400).json({ error: 'Producto desconocido' });
+      // El cliente solo selecciona un destino predefinido; nunca envía una URL arbitraria.
+      const returnUrl = req.body?.return_to_app === true
+        ? 'https://1basico.apruebatodo.cl/retorno-app.html'
+        : product.backUrl;
       const orderRef = randomUUID();
       // La referencia es aleatoria; nunca confiamos en un UID recibido del navegador.
       const payload = {
@@ -50,8 +54,8 @@ export function registerExamenesLibresOrders(app, admin) {
         description: product.reason,
         payer: { email: user.email },
         items: [{ title: product.reason, unit_price: String(product.amount), quantity: 1 }],
-        config: { online: { success_url: product.backUrl, failure_url: product.backUrl,
-          pending_url: product.backUrl, auto_return: 'approved' } }
+        config: { online: { success_url: returnUrl, failure_url: returnUrl,
+          pending_url: returnUrl, auto_return: 'approved' } }
       };
       // Persistir antes de crear la order: el webhook puede llegar inmediatamente.
       await db.collection('examenes_libres_orders').doc(orderRef).create({

@@ -201,6 +201,10 @@ export function registerExamenesLibresSubscriptions(app, admin) {
         return res.status(409).json({ code: 'PREMIUM_ALREADY_ACTIVE', error: 'Tu cuenta ya tiene Premium vigente. No se creará otra suscripción.' });
       }
 
+      // Mantener el regreso web por defecto; para Android usar una página HTTPS puente.
+      const returnUrl = req.body?.return_to_app === true
+        ? 'https://1basico.apruebatodo.cl/retorno-app.html'
+        : product.backUrl;
       const ref = randomUUID();
       await db.collection('examenes_libres_subscriptions').doc(ref).create({
         uid: user.uid, product: product.id, payerEmail, status: 'created',
@@ -210,7 +214,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: product.reason + ' — Mensual',
           external_reference: ref, payer_email: payerEmail,
-          back_url: product.backUrl,
+          back_url: returnUrl,
           auto_recurring: { frequency: 1, frequency_type: 'months',
             transaction_amount: MONTHLY_AMOUNT, currency_id: 'CLP' } }) });
       if (!sub.id || !sub.init_point) throw new Error('Suscripción inválida');
