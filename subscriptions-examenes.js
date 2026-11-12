@@ -21,7 +21,9 @@ async function mp(path, options = {}) {
         : undefined
     };
     console.error('MP_EXAMENES_SUSCRIPCION_RECHAZADA', detail);
-    throw new Error(`Mercado Pago HTTP ${r.status}`);
+    const error = new Error(`Mercado Pago HTTP ${r.status}`);
+    error.httpStatus = r.status;
+    throw error;
   }
   return data;
 }
@@ -68,6 +70,11 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       tx.create(paidRef, { uid: record.uid, product: record.product,
         subscriptionId: sub.id, paidAt: admin.firestore.FieldValue.serverTimestamp() });
     });
+    // Solo reflejar estado autorizado si MP sigue autorizado; nunca reactivar
+    // en la administración una suscripción que ya fue cancelada.
+    if (sub.status === 'authorized') {
+      await subscriptionRef.set({ status: 'authorized', lastVerifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    }
     return true;
   }
 
@@ -117,20 +124,83 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       return res.status(502).json({ error: 'No se pudo verificar el pago todavía' });
     }
   });
+  // Evitar suscripciones duplicadas incluso si el comprador abre el checkout
+  // en otra pestaña o usa otro correo de Mercado Pago. La comprobación real
+  // se hace con el token del VENDEDOR, no con el email del comprador.
+  async function existingSubscriptions(uid, productId) {
+    const list = await db.collection('examenes_libres_subscriptions')
+      .where('uid', '==', uid).limit(100).get();
+    if (list.size >= 100) throw new Error('Demasiados registros para verificar con seguridad');
+    let checkout = null;
+    for (const doc of list.docs) {
+      const record = doc.data();
+      if (record.product !== productId || !record.subscriptionId) continue;
+      // Si falla la consulta no crear otra suscripción a ciegas.
+      let mpSub;
+      try { mpSub = await mp(`/preapproval/${encodeURIComponent(record.subscriptionId)}`); }
+      catch (error) {
+        // Las suscripciones creadas con token de prueba no existen para el
+        // token productivo. No sirven para bloquear una compra de producción.
+        if (error.httpStatus === 404) continue;
+        throw error;
+      }
+      if (mpSub.id !== record.subscriptionId || mpSub.external_reference !== doc.id) {
+        throw new Error('La referencia de la suscripción no coincide con Mercado Pago');
+      }
+      if (record.status !== mpSub.status) {
+        await doc.ref.set({ status: mpSub.status, lastVerifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      }
+      if (mpSub.status === 'authorized') return { active: true, checkout: null };
+      if (mpSub.status === 'pending' && record.initPoint && !checkout) {
+        checkout = { init_point: record.initPoint, payerEmail: record.payerEmail };
+      }
+    }
+    return { active: false, checkout };
+  }
+
   app.post('/crear-suscripcion-examenes-libres', async (req, res) => {
+    let checkoutLockRef;
+    let lockOwner;
     try {
       const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '');
       if (!bearer) return res.sendStatus(401);
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
       if (!product || !user.uid) return res.status(400).json({ error: 'Datos inválidos' });
-      // El comprador de Mercado Pago puede ser distinto del alumno autenticado.
-      // El UID verificado del alumno y la referencia aleatoria siguen siendo
-      // la única asociación que puede habilitar Premium en Firebase.
       const payerEmail = String(req.body?.payer_email || '').trim().toLowerCase();
       if (payerEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
         return res.status(400).json({ error: 'Ingresa un correo válido de quien realizará el pago' });
       }
+
+      // Bloqueo temporal por UID: dos pestañas no pueden iniciar dos compras.
+      // Expira solo para permitir recuperación si el servidor se interrumpe.
+      checkoutLockRef = db.collection('examenes_libres_checkout_locks').doc(user.uid);
+      lockOwner = randomUUID();
+      const acquired = await db.runTransaction(async tx => {
+        const snap = await tx.get(checkoutLockRef);
+        if (snap.exists && Number(snap.data().expiresAtMs || 0) > Date.now()) return false;
+        tx.set(checkoutLockRef, { owner: lockOwner, expiresAtMs: Date.now() + 120000 });
+        return true;
+      });
+      if (!acquired) return res.status(409).json({ code: 'CHECKOUT_IN_PROGRESS', error: 'Ya estás iniciando una compra. Espera y vuelve a revisar antes de intentar otra vez.' });
+
+      const existing = await existingSubscriptions(user.uid, product.id);
+      if (existing.active) {
+        return res.status(409).json({ code: 'SUBSCRIPTION_ALREADY_ACTIVE', error: 'Ya tienes una suscripción mensual activa. No necesitas pagar otra vez. Revisa tu acceso Premium.' });
+      }
+      // No reutilizar checkout con otro correo; el pagador debe coincidir.
+      if (existing.checkout && existing.checkout.payerEmail === payerEmail) {
+        return res.json({ product: product.id, init_point: existing.checkout.init_point, reused: true });
+      }
+
+      const userDoc = await db.collection('users').doc(user.uid).get();
+      const membership = userDoc.data()?.products?.[product.id];
+      const until = membership?.premiumUntil;
+      const untilMs = until?.toMillis?.() || (until ? new Date(until).getTime() : 0);
+      if (membership?.premium === true && (until === null || untilMs > Date.now())) {
+        return res.status(409).json({ code: 'PREMIUM_ALREADY_ACTIVE', error: 'Tu cuenta ya tiene Premium vigente. No se creará otra suscripción.' });
+      }
+
       const ref = randomUUID();
       await db.collection('examenes_libres_subscriptions').doc(ref).create({
         uid: user.uid, product: product.id, payerEmail, status: 'created',
@@ -145,12 +215,21 @@ export function registerExamenesLibresSubscriptions(app, admin) {
             transaction_amount: MONTHLY_AMOUNT, currency_id: 'CLP' } }) });
       if (!sub.id || !sub.init_point) throw new Error('Suscripción inválida');
       await db.collection('examenes_libres_subscriptions').doc(ref).set({
-        subscriptionId: sub.id, status: sub.status || 'pending'
+        subscriptionId: sub.id, initPoint: sub.init_point, status: sub.status || 'pending'
       }, { merge: true });
       return res.json({ product: product.id, init_point: sub.init_point });
     } catch (err) {
       console.error('Crear suscripción', err);
-      return res.status(502).json({ error: 'No se pudo crear la suscripción' });
+      return res.status(502).json({ error: 'No fue posible verificar o iniciar la suscripción. No intentes pagar de nuevo hasta revisar tu estado Premium.' });
+    } finally {
+      if (checkoutLockRef && lockOwner) {
+        try {
+          await db.runTransaction(async tx => {
+            const snap = await tx.get(checkoutLockRef);
+            if (snap.exists && snap.data().owner === lockOwner) tx.delete(checkoutLockRef);
+          });
+        } catch (error) { console.warn('Liberar bloqueo de checkout', error.message); }
+      }
     }
   });
 

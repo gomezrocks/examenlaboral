@@ -141,10 +141,12 @@ export function registerApruebaTodoAdmin(app) {
             return {
               reference: doc.id, uid: s.uid, email: byUid.get(s.uid)?.email || null,
               status: s.status || 'unknown', subscriptionId: s.subscriptionId || null,
+              recordType: !s.subscriptionId ? 'attempt' : (invoiceCounts.get(s.subscriptionId) ? 'paid' : 'unpaid'),
               paidInvoicesInSample: invoiceCounts.get(s.subscriptionId) || 0,
               paymentState: invoiceCounts.get(s.subscriptionId) ? 'Con pago acreditado' : 'Sin factura acreditada',
               createdAt: iso(s.createdAt),
-              premiumUntil: byUid.get(s.uid)?.premiumUntil || null
+              // Esta vigencia pertenece al USUARIO, no al intento individual.
+              userPremiumUntil: byUid.get(s.uid)?.premiumUntil || null
             };
           });
           row.orders = orders.docs.map(doc => {
