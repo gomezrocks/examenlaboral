@@ -16,6 +16,32 @@ const iso = value => {
 };
 const bearerToken = request => /^Bearer (.+)$/.exec(request.headers.authorization || '')?.[1];
 
+// Sincroniza únicamente el estado administrativo, nunca acredita un pago ni
+// modifica premium/premiumUntil. Solo para referencias verificadas en Mercado Pago.
+async function verifiedSubscriptionState(db, reference, record, token) {
+  if (!record?.subscriptionId || record.product !== 'examenesLibres1Basico') return null;
+  const response = await fetch(`${API}/preapproval/${encodeURIComponent(record.subscriptionId)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  // Un ID antiguo de sandbox no existe con token productivo.
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Consulta de estado MP HTTP ${response.status}`);
+  const sub = await response.json();
+  if (sub.id !== record.subscriptionId || sub.external_reference !== reference ||
+      !['authorized', 'pending', 'paused', 'cancelled', 'canceled'].includes(sub.status)) {
+    throw new Error('Mercado Pago devolvió una identidad o estado de suscripción inesperado');
+  }
+  const ref = db.collection('examenes_libres_subscriptions').doc(reference);
+  await db.runTransaction(async tx => {
+    const latest = await tx.get(ref);
+    if (!latest.exists || latest.data().subscriptionId !== sub.id) throw new Error('Suscripción modificada durante verificación');
+    // No revertir cancelaciones registradas si hay una consulta concurrente antigua.
+    if (['cancelled', 'canceled'].includes(latest.data().status) && sub.status === 'authorized') return;
+    tx.set(ref, { status: sub.status, lastVerifiedAt: new Date() }, { merge: true });
+  });
+  return { status: sub.status, nextPaymentDate: sub.next_payment_date || null };
+}
+
 // Lectura paginada: los 200 primeros usuarios daban cifras falsas y dejaban
 // fuera precisamente las cuentas de prueba recién creadas.
 async function readCollection(db, name, max = 10000) {
@@ -91,15 +117,11 @@ export function registerApruebaTodoAdmin(app) {
       if (!snapshot.exists || !snapshot.data().subscriptionId) return res.sendStatus(404);
       const token = process.env.MP_EXAMENES_ACCESS_TOKEN;
       if (!token) return res.status(503).json({ error: 'Falta token de Mercado Pago' });
-      const response = await fetch(`${API}/preapproval/${encodeURIComponent(snapshot.data().subscriptionId)}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!response.ok) return res.status(502).json({ error: `Mercado Pago respondió ${response.status}` });
-      const sub = await response.json();
-      if (sub.id !== snapshot.data().subscriptionId || sub.external_reference !== reference) return res.sendStatus(409);
+      const state = await verifiedSubscriptionState(db, reference, snapshot.data(), token);
+      if (!state) return res.status(404).json({ error: 'Suscripción no encontrada en este ambiente de Mercado Pago' });
       res.setHeader('Cache-Control', 'no-store');
-      return res.json({ status: sub.status, nextPaymentDate: sub.next_payment_date || null,
-        recordedStatus: snapshot.data().status || 'unknown' });
+      return res.json({ status: state.status, nextPaymentDate: state.nextPaymentDate,
+        recordedStatus: state.status });
     } catch (error) {
       console.error('Admin ApruebaTodo consultar estado', error.message);
       return res.status(502).json({ error: 'No fue posible consultar Mercado Pago' });
@@ -130,6 +152,28 @@ export function registerApruebaTodoAdmin(app) {
             readCollection(db, 'examenes_libres_orders'),
             readCollection(db, 'examenes_libres_paid_invoices')
           ]);
+          // En cada actualización del administrador sincronizamos las suscripciones
+          // con facturas registradas que aún muestran 'pending'. No consultar
+          // todos los intentos sin pagar ni realizar cobros nuevos.
+          const paidSubIds = new Set(invoices.docs.map(doc => doc.data().subscriptionId).filter(Boolean));
+          const candidates = subscriptions.docs.filter(doc =>
+            paidSubIds.has(doc.data().subscriptionId) &&
+            ['pending', 'created'].includes(doc.data().status));
+          if (candidates.length > 25) {
+            console.warn('Admin ApruebaTodo: más de 25 suscripciones pagadas pendientes; sincronización limitada');
+          }
+          const token = process.env.MP_EXAMENES_ACCESS_TOKEN;
+          const verifiedStatuses = new Map();
+          if (token) for (const doc of candidates.slice(0, 25)) {
+            try {
+              const state = await verifiedSubscriptionState(db, doc.id, doc.data(), token);
+              if (state) verifiedStatuses.set(doc.id, state.status);
+            } catch (error) {
+              console.warn('MP_EXAMENES_ADMIN_ESTADO_NO_SINCRONIZADO', {
+                reference: doc.id, reason: error.message
+              });
+            }
+          }
           const byUid = new Map(normalized.map(u => [u.uid, u]));
           const invoiceCounts = new Map();
           for (const doc of invoices.docs) {
@@ -140,7 +184,7 @@ export function registerApruebaTodoAdmin(app) {
             const s = doc.data();
             return {
               reference: doc.id, uid: s.uid, email: byUid.get(s.uid)?.email || null,
-              status: s.status || 'unknown', subscriptionId: s.subscriptionId || null,
+              status: verifiedStatuses.get(doc.id) || s.status || 'unknown', subscriptionId: s.subscriptionId || null,
               recordType: !s.subscriptionId ? 'attempt' : (invoiceCounts.get(s.subscriptionId) ? 'paid' : 'unpaid'),
               paidInvoicesInSample: invoiceCounts.get(s.subscriptionId) || 0,
               paymentState: invoiceCounts.get(s.subscriptionId) ? 'Con pago acreditado' : 'Sin factura acreditada',
