@@ -21,9 +21,21 @@ const examOrdersWebhook = registerExamenesLibresOrders(app, examAdmin);
 const examSubscriptionsWebhook = registerExamenesLibresSubscriptions(app, examAdmin);
 // Un único destino HTTPS de webhooks en Mercado Pago para ambas modalidades.
 app.post("/webhook-examenes-libres", (req, res) => {
-  const type = req.body?.type;
-  if (type === "order") return examOrdersWebhook(req, res);
-  if (type === "subscription_authorized_payment") return examSubscriptionsWebhook(req, res);
+  // Diagnóstico no sensible: jamás registrar firmas o el payload completo.
+  const type = String(req.body?.type || "");
+  const action = String(req.body?.action || "");
+  const destination = type === "order" ? "orders" :
+    type === "subscription_authorized_payment" ? "subscription_payment" : "ignored";
+  console.info("MP_EXAMENES_WEBHOOK_ENTRADA", {
+    type: type.slice(0, 70), action: action.slice(0, 70),
+    destination, hasSignature: Boolean(req.headers["x-signature"]),
+    hasRequestId: Boolean(req.headers["x-request-id"])
+  });
+  res.once("finish", () => console.info("MP_EXAMENES_WEBHOOK_RESPUESTA", {
+    type: type.slice(0, 70), destination, httpStatus: res.statusCode
+  }));
+  if (destination === "orders") return examOrdersWebhook(req, res);
+  if (destination === "subscription_payment") return examSubscriptionsWebhook(req, res);
   return res.sendStatus(200);
 });
 
