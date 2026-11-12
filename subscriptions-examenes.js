@@ -233,23 +233,68 @@ export function registerExamenesLibresSubscriptions(app, admin) {
     }
   });
 
-  // Se activa ÚNICAMENTE por factura recurrente cobrada, no por la autorización.
+  // Nunca se acredita Premium por un cambio de estado de suscripción.
+  // Tanto un aviso de factura como uno de preapproval deben llevarnos a
+  // consultar la fuente de verdad en Mercado Pago.
+  async function reconcileByPreapprovalId(preapprovalId) {
+    const subscriptionId = String(preapprovalId || '');
+    if (!/^[a-zA-Z0-9-]{12,100}$/.test(subscriptionId)) return { checked: 0, credited: 0 };
+    const subscription = await mp(`/preapproval/${encodeURIComponent(subscriptionId)}`);
+    const ref = String(subscription?.external_reference || '');
+    if (!ref || !subscription?.id || String(subscription.id) !== subscriptionId) {
+      return { checked: 0, credited: 0 };
+    }
+    const saved = await db.collection('examenes_libres_subscriptions').doc(ref).get();
+    if (!saved.exists || saved.data()?.subscriptionId !== subscriptionId ||
+        saved.data()?.product !== 'examenesLibres1Basico') {
+      return { checked: 0, credited: 0 };
+    }
+    // La colección contiene el UID real del estudiante. El correo del pagador
+    // no puede alterar a quién se entrega el Premium.
+    const invoices = await mp(`/authorized_payments/search?preapproval_id=${encodeURIComponent(subscriptionId)}`);
+    const results = Array.isArray(invoices.results) ? invoices.results : [];
+    // Nunca afirmar que revisamos todas las facturas si Mercado Pago pagina.
+    // El procesamiento normal de cada factura sigue en el evento individual.
+    let credited = 0;
+    for (const invoice of results) {
+      if (await creditAuthorizedPayment(invoice, saved.data().uid)) credited++;
+    }
+    console.info('MP_EXAMENES_WEBHOOK_CONCILIACION', {
+      source: 'preapproval', checked: results.length, processed: credited,
+      hasMore: Number(invoices.paging?.total || 0) > results.length
+    });
+    return { checked: results.length, credited };
+  }
+
   const subscriptionWebhook = async (req, res) => {
+    const type = String(req.body?.type || '');
     const id = req.query['data.id'] || req.body?.data?.id;
     if (!validWebhookSignature({ signature: req.headers['x-signature'],
       requestId: req.headers['x-request-id'], dataId: id,
       secret: process.env.MP_EXAMENES_WEBHOOK_SECRET })) {
-      console.warn('MP_EXAMENES_WEBHOOK', { reason: 'invalid_signature', type: req.body?.type });
+      console.warn('MP_EXAMENES_WEBHOOK', { reason: 'invalid_signature', type });
       return res.sendStatus(401);
     }
-    if (req.body?.type !== 'subscription_authorized_payment') return res.sendStatus(200);
     try {
-      const invoice = await mp(`/authorized_payments/${encodeURIComponent(id)}`);
-      const credited = await creditAuthorizedPayment(invoice);
-      console.info('MP_EXAMENES_WEBHOOK', { type: req.body.type, credited });
+      if (type === 'subscription_authorized_payment') {
+        // El ID recibido identifica una FACTURA, no una suscripción.
+        const invoice = await mp(`/authorized_payments/${encodeURIComponent(String(id))}`);
+        const credited = await creditAuthorizedPayment(invoice);
+        console.info('MP_EXAMENES_WEBHOOK_FACTURA', { checked: true, processed: credited });
+        return res.sendStatus(200);
+      }
+      if (type === 'subscription_preapproval') {
+        // El ID recibido identifica la SUSCRIPCIÓN. Su estado autorizado
+        // NO equivale a una mensualidad pagada.
+        await reconcileByPreapprovalId(id);
+        return res.sendStatus(200);
+      }
       return res.sendStatus(200);
     } catch (err) {
-      console.error('Webhook factura recurrente', err);
+      console.error('MP_EXAMENES_WEBHOOK_ERROR', {
+        type, httpStatus: err?.httpStatus || null,
+        message: String(err?.message || 'Error de conciliación').slice(0, 180)
+      });
       return res.sendStatus(500);
     }
   };

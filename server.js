@@ -25,7 +25,7 @@ app.post("/webhook-examenes-libres", (req, res) => {
   const type = String(req.body?.type || "");
   const action = String(req.body?.action || "");
   const destination = type === "order" ? "orders" :
-    type === "subscription_authorized_payment" ? "subscription_payment" : "ignored";
+    type === "subscription_authorized_payment" || type === "subscription_preapproval" ? "subscriptions" : "ignored";
   console.info("MP_EXAMENES_WEBHOOK_ENTRADA", {
     type: type.slice(0, 70), action: action.slice(0, 70),
     destination, hasSignature: Boolean(req.headers["x-signature"]),
@@ -35,7 +35,7 @@ app.post("/webhook-examenes-libres", (req, res) => {
     type: type.slice(0, 70), destination, httpStatus: res.statusCode
   }));
   if (destination === "orders") return examOrdersWebhook(req, res);
-  if (destination === "subscription_payment") return examSubscriptionsWebhook(req, res);
+  if (destination === "subscriptions") return examSubscriptionsWebhook(req, res);
   return res.sendStatus(200);
 });
 
