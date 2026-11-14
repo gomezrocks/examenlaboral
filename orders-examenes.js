@@ -1,5 +1,5 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { getProduct } from './productos-examenes.js';
+import { getProduct, isProductAvailableForSale } from './productos-examenes.js';
 
 const MP_API = 'https://api.mercadopago.com/v1/orders';
 const readToken = () => {
@@ -41,8 +41,24 @@ export function registerExamenesLibresOrders(app, admin) {
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
       if (!product) return res.status(400).json({ error: 'Producto desconocido' });
+      if (!(await isProductAvailableForSale(product.id, db))) {
+        return res.status(409).json({ code: 'COURSE_NOT_PUBLISHED',
+          error: 'Los pagos de 2° Básico se habilitarán al terminar la revisión de las preguntas.' });
+      }
+      // Evitar que el estudiante pague dos veces por un curso ya desbloqueado.
+      // Esta comprobación no altera la lógica histórica de 1° Básico.
+      if (product.id === 'examenesLibres2Basico') {
+        const memberSnap = await db.collection('users').doc(user.uid).get();
+        const member = memberSnap.data()?.products?.[product.id];
+        const until = member?.premiumUntil;
+        const untilMs = until?.toMillis?.() || (until ? new Date(until).getTime() : 0);
+        if (member?.premium === true && (until === null || untilMs > Date.now())) {
+          return res.status(409).json({ code: 'PREMIUM_ALREADY_ACTIVE',
+            error: 'Ya tienes Premium vigente de 2° Básico. No necesitas pagar de nuevo.' });
+        }
+      }
       // El cliente solo selecciona un destino predefinido; nunca envía una URL arbitraria.
-      const returnUrl = req.body?.return_to_app === true
+      const returnUrl = req.body?.return_to_app === true && product.id === 'examenesLibres1Basico'
         ? 'https://1basico.apruebatodo.cl/retorno-app.html'
         : product.backUrl;
       const orderRef = randomUUID();

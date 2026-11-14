@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { getProduct } from './productos-examenes.js';
+import { getProduct, isProductAvailableForSale } from './productos-examenes.js';
 import { validWebhookSignature } from './orders-examenes.js';
 
 const API = 'https://api.mercadopago.com';
 const MONTHLY_AMOUNT = 4990;
-// IDs independientes. Renovar 2° jamás acredita 1°, ni viceversa.
-const isKnownCourse = id => ['examenesLibres1Basico','examenesLibres2Basico'].includes(id);
+// Acreditación siempre aislada por curso, también al reconciliar webhooks.
+const isKnownCourse = id => ['examenesLibres1Basico', 'examenesLibres2Basico'].includes(id);
 async function mp(path, options = {}) {
   if (!process.env.MP_EXAMENES_ACCESS_TOKEN) throw new Error('Falta token de Mercado Pago');
   const r = await fetch(API + path, { ...options, headers: {
@@ -169,6 +169,10 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
       if (!product || !user.uid) return res.status(400).json({ error: 'Datos inválidos' });
+      if (!(await isProductAvailableForSale(product.id, db))) {
+        return res.status(409).json({ code: 'COURSE_NOT_PUBLISHED',
+          error: 'Los pagos de 2° Básico se habilitarán al terminar la revisión de las preguntas.' });
+      }
       const payerEmail = String(req.body?.payer_email || '').trim().toLowerCase();
       if (payerEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
         return res.status(400).json({ error: 'Ingresa un correo válido de quien realizará el pago' });
@@ -204,7 +208,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       }
 
       // Mantener el regreso web por defecto; para Android usar una página HTTPS puente.
-      const returnUrl = req.body?.return_to_app === true
+      const returnUrl = req.body?.return_to_app === true && product.id === 'examenesLibres1Basico'
         ? 'https://1basico.apruebatodo.cl/retorno-app.html'
         : product.backUrl;
       const ref = randomUUID();
