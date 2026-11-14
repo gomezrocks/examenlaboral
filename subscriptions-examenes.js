@@ -4,6 +4,8 @@ import { validWebhookSignature } from './orders-examenes.js';
 
 const API = 'https://api.mercadopago.com';
 const MONTHLY_AMOUNT = 4990;
+// IDs independientes. Renovar 2° jamás acredita 1°, ni viceversa.
+const isKnownCourse = id => ['examenesLibres1Basico','examenesLibres2Basico'].includes(id);
 async function mp(path, options = {}) {
   if (!process.env.MP_EXAMENES_ACCESS_TOKEN) throw new Error('Falta token de Mercado Pago');
   const r = await fetch(API + path, { ...options, headers: {
@@ -45,7 +47,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
     if (!saved.exists || saved.data().subscriptionId !== sub.id ||
         (expectedUid && saved.data().uid !== expectedUid)) return false;
     const record = saved.data();
-    if (record.product !== 'examenesLibres1Basico') return false;
+    if (!isKnownCourse(record.product)) return false;
     const paidRef = db.collection('examenes_libres_paid_invoices').doc(String(invoice.id));
     await db.runTransaction(async tx => {
       const prior = await tx.get(paidRef);
@@ -100,7 +102,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
       // a ApruebaTodo, especialmente con usuarios de prueba. El vínculo seguro
       // es la referencia aleatoria creada por Render y su UID verificado.
       if (saved.data().uid !== user.uid || saved.data().subscriptionId !== id ||
-          saved.data().product !== 'examenesLibres1Basico') {
+          !isKnownCourse(saved.data().product)) {
         console.warn('MP_EXAMENES_ASOCIACION', {
           reason: saved.data().uid !== user.uid ? 'firebase_uid_mismatch' :
             saved.data().subscriptionId !== id ? 'subscription_id_mismatch' : 'product_mismatch'
@@ -114,11 +116,11 @@ export function registerExamenesLibresSubscriptions(app, admin) {
         if (await creditAuthorizedPayment(invoice, user.uid)) credited = true;
       }
       const userDoc = await db.collection('users').doc(user.uid).get();
-      const active = userDoc.data()?.products?.examenesLibres1Basico;
+      const active = userDoc.data()?.products?.[saved.data().product];
       const until = active?.premiumUntil?.toMillis?.() ?? 0;
       const premium = active?.premium === true && (active?.premiumUntil === null || until > Date.now());
       console.info('MP_EXAMENES_RECONCILIACION', { credited, premium, invoiceCount: (invoices.results || []).length });
-      return res.json({ premium, status: premium ? 'active' : 'pending' });
+      return res.json({ product: saved.data().product, premium, status: premium ? 'active' : 'pending' });
     } catch (err) {
       console.error('Confirmar suscripción Exámenes Libres', err);
       return res.status(502).json({ error: 'No se pudo verificar el pago todavía' });
@@ -250,7 +252,7 @@ export function registerExamenesLibresSubscriptions(app, admin) {
     }
     const saved = await db.collection('examenes_libres_subscriptions').doc(ref).get();
     if (!saved.exists || saved.data()?.subscriptionId !== subscriptionId ||
-        saved.data()?.product !== 'examenesLibres1Basico') {
+        !isKnownCourse(saved.data()?.product)) {
       return { checked: 0, credited: 0 };
     }
     // La colección contiene el UID real del estudiante. El correo del pagador
