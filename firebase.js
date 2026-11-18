@@ -46,6 +46,7 @@ function firebaseApp(name, envName, fallbackEnvName = null) {
 }
 
 export function dbForProduct(productId = "finesLaborales") {
+  if (productId === "finesLaboralesBasica") { return getFirestore(finesBasicaApp()); }
   if (String(productId).startsWith("examenesLibres")) {
     return getFirestore(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]));
   }
@@ -57,6 +58,7 @@ export function dbForProduct(productId = "finesLaborales") {
 }
 
 export function firebaseProjectForProduct(productId = "finesLaborales") {
+  if (productId === "finesLaboralesBasica") { finesBasicaApp(); return projectIds.finesBasica; }
   if (String(productId).startsWith("examenesLibres")) {
     firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]);
     return projectIds.examenesLibres;
@@ -71,6 +73,7 @@ export function firebaseProjectForProduct(productId = "finesLaborales") {
 }
 
 export function authForProduct(productId = "finesLaborales") {
+  if (productId === "finesLaboralesBasica") { return getAuth(finesBasicaApp()); }
   if (String(productId).startsWith("examenesLibres")) {
     return getAuth(firebaseApp("examenesLibres", ["FIREBASE_SERVICE_ACCOUNT_EXAMENES", "EXAMENES_FIREBASE_SERVICE_ACCOUNT", "FIREBASE_SERVICE_ACCOUNT"]));
   }
@@ -78,4 +81,10 @@ export function authForProduct(productId = "finesLaborales") {
     return getAuth(firebaseApp("paes", ["FIREBASE_SERVICE_ACCOUNT_PAES", "PAES_FIREBASE_SERVICE_ACCOUNT"]));
   }
   return getAuth(firebaseApp("finesLaborales", ["FIREBASE_SERVICE_ACCOUNT_FINES", "FINES_FIREBASE_SERVICE_ACCOUNT"], "FIREBASE_SERVICE_ACCOUNT"));
+}
+
+function finesBasicaApp(){
+ const parsed=parseServiceAccount('FIREBASE_SERVICE_ACCOUNT_FINES_BASICA');
+ if(parsed?.serviceAccount?.project_id !== 'examenlibre') throw new Error('Configura la cuenta de servicio del proyecto examenlibre');
+ return firebaseApp('finesBasica','FIREBASE_SERVICE_ACCOUNT_FINES_BASICA');
 }

@@ -6,10 +6,29 @@ import { registerExamenesLibresOrders } from "./orders-examenes.js";
 import { registerExamenesLibresSubscriptions } from "./subscriptions-examenes.js";
 import { registerApruebaTodoAdmin } from "./admin-apruebatodo.js";
 
+import { registerExamenesLibresOrders as registerFinesBasicaOrders } from './orders-fines-basica.js';
+import { registerExamenesLibresSubscriptions as registerFinesBasicaSubscriptions } from './subscriptions-fines-basica.js';
 const app = express();
 app.use(cors());
 app.use(express.json());
 registerApruebaTodoAdmin(app);
+// Inicialización diferida: no afecta otros productos si faltan credenciales.
+let finesBasicaRouter;
+app.use((req,res,next)=>{
+ if(!/^\/(crear-order|crear-suscripcion|confirmar-suscripcion|cancelar-suscripcion|webhook|estado)-fines-basica(?:$|[-/])/.test(req.path)) return next();
+ try {
+  if(!finesBasicaRouter){
+   if(!process.env.MP_FINES_BASICA_ACCESS_TOKEN || !process.env.MP_FINES_BASICA_WEBHOOK_SECRET) throw new Error('Credenciales pendientes');
+   const router=express.Router();
+   const admin={firestore:Object.assign(()=>dbForProduct('finesLaboralesBasica'),{FieldValue,Timestamp}),auth:()=>authForProduct('finesLaboralesBasica')};
+   const orders=registerFinesBasicaOrders(router,admin), subs=registerFinesBasicaSubscriptions(router,admin);
+   router.post('/webhook-fines-basica',(req,res)=>{const type=req.body?.type; if(type==='order')return orders(req,res); if(['subscription_authorized_payment','subscription_preapproval'].includes(type))return subs(req,res);return res.sendStatus(200);});
+   finesBasicaRouter=router;
+  }
+  return finesBasicaRouter(req,res,next);
+ } catch(e){console.warn('FINES_BASICA_CONFIG',e.message);return res.status(503).json({error:'Pagos temporalmente no disponibles'});}
+});
+
 
 // Integración aislada: las rutas anteriores de PAES/Fines Laborales permanecen iguales.
 // Firebase Admin de Exámenes Libres se inicializa de forma diferida al primer uso.
