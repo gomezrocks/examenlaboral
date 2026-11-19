@@ -6,7 +6,7 @@ import { registerExamenesLibresOrders } from "./orders-examenes.js";
 import { registerExamenesLibresSubscriptions } from "./subscriptions-examenes.js";
 import { registerApruebaTodoAdmin } from "./admin-apruebatodo.js";
 
-import { registerExamenesLibresOrders as registerFinesBasicaOrders } from './orders-fines-basica.js';
+import { validWebhookSignature, registerExamenesLibresOrders as registerFinesBasicaOrders } from './orders-fines-basica.js';
 import { registerExamenesLibresSubscriptions as registerFinesBasicaSubscriptions } from './subscriptions-fines-basica.js';
 const app = express();
 app.use(cors());
@@ -14,18 +14,21 @@ app.use(express.json());
 registerApruebaTodoAdmin(app);
 // Inicialización diferida: no afecta otros productos si faltan credenciales.
 let finesBasicaRouter;
+let finesBasicaHandlers;
+function getFinesBasicaRouter(){
+  if(finesBasicaRouter) return finesBasicaRouter;
+  if(!process.env.MP_FINES_BASICA_ACCESS_TOKEN || !process.env.MP_FINES_BASICA_WEBHOOK_SECRET) throw new Error("Credenciales pendientes");
+  const router=express.Router();
+  const admin={firestore:Object.assign(()=>dbForProduct("finesLaboralesBasica"),{FieldValue,Timestamp}),auth:()=>authForProduct("finesLaboralesBasica")};
+  const orders=registerFinesBasicaOrders(router,admin), subs=registerFinesBasicaSubscriptions(router,admin);
+  router.post("/webhook-fines-basica",(req,res)=>{const type=req.body?.type; if(type==="order")return orders(req,res); if(["subscription_authorized_payment","subscription_preapproval"].includes(type))return subs(req,res);return res.sendStatus(200);});
+  finesBasicaHandlers={orders,subscriptions:subs};
+  return finesBasicaRouter=router;
+}
 app.use((req,res,next)=>{
  if(!/^\/(crear-order|crear-suscripcion|confirmar-suscripcion|cancelar-suscripcion|webhook|estado)-fines-basica(?:$|[-/])/.test(req.path)) return next();
  try {
-  if(!finesBasicaRouter){
-   if(!process.env.MP_FINES_BASICA_ACCESS_TOKEN || !process.env.MP_FINES_BASICA_WEBHOOK_SECRET) throw new Error('Credenciales pendientes');
-   const router=express.Router();
-   const admin={firestore:Object.assign(()=>dbForProduct('finesLaboralesBasica'),{FieldValue,Timestamp}),auth:()=>authForProduct('finesLaboralesBasica')};
-   const orders=registerFinesBasicaOrders(router,admin), subs=registerFinesBasicaSubscriptions(router,admin);
-   router.post('/webhook-fines-basica',(req,res)=>{const type=req.body?.type; if(type==='order')return orders(req,res); if(['subscription_authorized_payment','subscription_preapproval'].includes(type))return subs(req,res);return res.sendStatus(200);});
-   finesBasicaRouter=router;
-  }
-  return finesBasicaRouter(req,res,next);
+  return getFinesBasicaRouter()(req,res,next);
  } catch(e){console.warn('FINES_BASICA_CONFIG',e.message);return res.status(503).json({error:'Pagos temporalmente no disponibles'});}
 });
 
@@ -39,7 +42,7 @@ const examAdmin = {
 const examOrdersWebhook = registerExamenesLibresOrders(app, examAdmin);
 const examSubscriptionsWebhook = registerExamenesLibresSubscriptions(app, examAdmin);
 // Un único destino HTTPS de webhooks en Mercado Pago para ambas modalidades.
-app.post("/webhook-examenes-libres", (req, res) => {
+app.post("/webhook-examenes-libres", async (req, res) => {
   // Diagnóstico no sensible: jamás registrar firmas o el payload completo.
   const type = String(req.body?.type || "");
   const action = String(req.body?.action || "");
@@ -53,9 +56,44 @@ app.post("/webhook-examenes-libres", (req, res) => {
   res.once("finish", () => console.info("MP_EXAMENES_WEBHOOK_RESPUESTA", {
     type: type.slice(0, 70), destination, httpStatus: res.statusCode
   }));
-  if (destination === "orders") return examOrdersWebhook(req, res);
-  if (destination === "subscriptions") return examSubscriptionsWebhook(req, res);
-  return res.sendStatus(200);
+  if (destination === "ignored") return res.sendStatus(200);
+  const legacy = destination === "orders" ? examOrdersWebhook : examSubscriptionsWebhook;
+  const id = req.query['data.id'] || req.body?.data?.id;
+  if (!validWebhookSignature({signature:req.headers['x-signature'], requestId:req.headers['x-request-id'], dataId:id, secret:process.env.MP_EXAMENES_WEBHOOK_SECRET})) return res.sendStatus(401);
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(String(id))) return res.sendStatus(400);
+  try {
+    const token = process.env.MP_EXAMENES_ACCESS_TOKEN;
+    async function lookup(path){
+      const response=await fetch('https://api.mercadopago.com'+path,{headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(10000)});
+      if(!response.ok) throw new Error(`MP HTTP ${response.status}`);
+      return response.json();
+    }
+    let resource;
+    if(type==='order') resource=await lookup('/v1/orders/'+encodeURIComponent(id));
+    else if(type==='subscription_preapproval') resource=await lookup('/preapproval/'+encodeURIComponent(id));
+    else {
+      const invoice=await lookup('/authorized_payments/'+encodeURIComponent(id));
+      if(!invoice.preapproval_id) throw new Error('Factura sin preapproval_id');
+      resource=await lookup('/preapproval/'+encodeURIComponent(invoice.preapproval_id));
+    }
+    const ref=String(resource.external_reference||'');
+    if(!ref || ref.includes('/') || ref.length>500) return legacy(req,res);
+    const suffix=destination==='orders'?'orders':'subscriptions';
+    const exam=await examAdmin.firestore().collection('examenes_libres_'+suffix).doc(ref).get();
+    if(exam.exists) return legacy(req,res);
+    // Fines Básica usa las mismas credenciales de producción; si no coinciden,
+    // no confirmar una notificación que podría corresponder a ese producto.
+    if(process.env.MP_FINES_BASICA_ACCESS_TOKEN!==token || process.env.MP_FINES_BASICA_WEBHOOK_SECRET!==process.env.MP_EXAMENES_WEBHOOK_SECRET) throw new Error('Credenciales compartidas no coinciden');
+    const fines=await dbForProduct('finesLaboralesBasica').collection('fines_basica_'+suffix).doc(ref).get();
+    if(!fines.exists) return res.sendStatus(200);
+    if(fines.data()?.product!=='finesLaboralesBasica') throw new Error('Producto inesperado');
+    getFinesBasicaRouter();
+    console.info('MP_WEBHOOK_COMPARTIDO',{type, destination:'finesLaboralesBasica'});
+    return finesBasicaHandlers[destination](req,res);
+  } catch(e){
+    console.error('MP_WEBHOOK_COMPARTIDO_ERROR',String(e.message).slice(0,150));
+    return res.sendStatus(503);
+  }
 });
 
 const BASE_URL = process.env.BASE_URL; // legado
