@@ -1,6 +1,16 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { getProduct, isProductAvailableForSale } from './productos-fines-basica.js';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PLAN_AMOUNTS = Object.freeze({ day: 990, once: 12990 });
+function planAmount(plan) { return Object.hasOwn(PLAN_AMOUNTS, plan) ? PLAN_AMOUNTS[plan] : null; }
+export function orderGrant(plan, existing, now) {
+  if (plan === 'once' || (existing?.premium === true && existing.premiumUntil === null)) return null;
+  if (plan !== 'day') throw new Error('Plan desconocido');
+  const previous = existing?.premiumUntil?.toMillis?.() || 0;
+  return new Date(Math.max(now + DAY_MS, previous));
+}
+
 const MP_API = 'https://api.mercadopago.com/v1/orders';
 const readToken = () => {
   const token = process.env.MP_FINES_BASICA_ACCESS_TOKEN;
@@ -41,6 +51,10 @@ export function registerExamenesLibresOrders(app, admin) {
       const user = await admin.auth().verifyIdToken(bearer[1], true);
       const product = getProduct(req.body?.product);
       if (!product) return res.status(400).json({ error: 'Producto desconocido' });
+      const plan = req.body?.plan ?? 'once';
+      const amount = planAmount(plan);
+      if (amount === null) return res.status(400).json({ error: 'Plan desconocido' });
+      const reason = product.reason + (plan === 'day' ? ' — 24 horas' : ' — Permanente');
       if (!(await isProductAvailableForSale(product.id, db))) {
         return res.status(409).json({ code: 'COURSE_NOT_PUBLISHED',
           error: 'Los pagos todavía no están habilitados.' });
@@ -63,17 +77,17 @@ export function registerExamenesLibresOrders(app, admin) {
       // La referencia es aleatoria; nunca confiamos en un UID recibido del navegador.
       const payload = {
         type: 'online', processing_mode: 'manual',
-        total_amount: String(product.amount),
+        total_amount: String(amount),
         external_reference: orderRef,
-        description: product.reason,
+        description: reason,
         payer: { email: user.email },
-        items: [{ title: product.reason, unit_price: String(product.amount), quantity: 1 }],
+        items: [{ title: reason, unit_price: String(amount), quantity: 1 }],
         config: { online: { success_url: returnUrl, failure_url: returnUrl,
           pending_url: returnUrl, auto_return: 'approved' } }
       };
       // Persistir antes de crear la order: el webhook puede llegar inmediatamente.
       await db.collection('fines_basica_orders').doc(orderRef).create({
-        uid: user.uid, product: product.id, amount: product.amount,
+        uid: user.uid, product: product.id, plan, amount,
         status: 'initiated', createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       const order = await mpRequest('', { method: 'POST',
@@ -81,7 +95,7 @@ export function registerExamenesLibresOrders(app, admin) {
         body: JSON.stringify(payload) });
       if (!order.checkout_url || order.external_reference !== orderRef) throw new Error('Respuesta de order inválida');
       await db.collection('fines_basica_orders').doc(orderRef).set({ mpOrderId: order.id, status: 'created' }, { merge: true });
-      return res.json({ product: product.id, checkout_url: order.checkout_url });
+      return res.json({ product: product.id, plan, amount, checkout_url: order.checkout_url });
     } catch (err) {
       console.error('Crear order Fines Laborales Básica', err);
       return res.status(502).json({ error: 'No se pudo iniciar el pago. Intenta más tarde.' });
@@ -104,37 +118,42 @@ export function registerExamenesLibresOrders(app, admin) {
       if (!pending.exists) return res.sendStatus(200);
       const record = pending.data();
       const product = getProduct(record.product);
+      // Órdenes antiguas sin plan corresponden exclusivamente al acceso permanente.
+      const plan = record.plan ?? "once";
+      const amount = planAmount(plan);
       // Orders puede devolver la moneda como currency_id. La notificación
       // firmada incluye ese campo aun cuando GET omita la propiedad.
       const currency = order.currency_id || order.currency || req.body?.data?.currency_id;
       const expectedApplication = process.env.MP_FINES_BASICA_APP_ID;
       const notificationApplication = String(req.body?.application_id ?? '');
-      if (!product || order.external_reference !== pending.id ||
+      if (!product || amount === null || Number(record.amount) !== amount || order.external_reference !== pending.id ||
           (record.mpOrderId && record.mpOrderId !== order.id) ||
           (expectedApplication && notificationApplication !== String(expectedApplication)) ||
-          currency !== 'CLP' || Number(order.total_amount) !== product.amount) {
+          currency !== 'CLP' || Number(order.total_amount) !== amount) {
         console.warn('MP_FINES_BASICA_ORDER_RECHAZADA', {
           productKnown: Boolean(product), referenceMatches: order.external_reference === pending.id,
           orderIdMatches: !record.mpOrderId || record.mpOrderId === order.id,
           applicationMatches: !expectedApplication || notificationApplication === String(expectedApplication),
-          currency, amountMatches: Boolean(product && Number(order.total_amount) === product.amount)
+          currency, amountMatches: Boolean(product && Number(order.total_amount) === amount)
         });
         return res.status(409).json({ error: 'Order no coincide con el producto' });
       }
       if (order.status !== 'processed' || order.status_detail !== 'accredited' ||
-          Number(order.total_paid_amount) < product.amount) return res.sendStatus(200);
+          !(Number(order.total_paid_amount) >= amount)) return res.sendStatus(200);
       await db.runTransaction(async tx => {
         const current = await tx.get(ref);
         if (current.data()?.status === 'accredited') return;
         const userRef = db.collection('fines_basica_entitlements').doc(record.uid);
+        const userSnap = await tx.get(userRef);
+        const until = orderGrant(plan, userSnap.data()?.products?.[product.id], Date.now());
         tx.set(userRef, { products: { [product.id]: {
-          premium: true, premiumUntil: null,
+          premium: true, premiumUntil: until === null ? null : admin.firestore.Timestamp.fromDate(until),
           premiumSince: admin.firestore.FieldValue.serverTimestamp()
         } } }, { merge: true });
         tx.set(ref, { status: 'accredited', mpOrderId: order.id,
           creditedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       });
-      console.info('MP_FINES_BASICA_ORDER_ACREDITADA', { product: product.id });
+      console.info('MP_FINES_BASICA_ORDER_ACREDITADA', { product: product.id, plan, amount });
       return res.sendStatus(200);
     } catch (err) {
       console.error('Webhook Orders Fines Laborales Básica', err);
